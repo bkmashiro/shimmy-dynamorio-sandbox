@@ -1,33 +1,66 @@
-FROM ubuntu:22.04
+# DynamoRIO Syscall Virtualization Sandbox
+# Build: docker build -t dynamorio-sandbox .
+# Run:   docker run --rm -e DR_SESSION_ID=my-session dynamorio-sandbox \
+#            /opt/dynamorio/bin64/drrun -c /opt/sandbox/syscall_filter.so \
+#            -- /opt/sandbox/test_open
+
+FROM --platform=linux/amd64 ubuntu:22.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        wget \
+        ca-certificates \
+        libunwind-dev \
+        && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y \
-    wget \
-    cmake \
-    build-essential \
-    gcc \
-    g++ \
-    make \
-    libelf-dev \
-    libunwind-dev \
-    git \
-    curl \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# Download and install DynamoRIO
+ENV DYNAMORIO_VERSION=11.91.20545
+ENV DYNAMORIO_HOME=/opt/dynamorio
 
-# Install DynamoRIO
-RUN wget -q https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-10.92.19975/DynamoRIO-Linux-10.92.19975.tar.gz \
-    -O /tmp/dynamorio.tar.gz && \
-    tar -xzf /tmp/dynamorio.tar.gz -C /opt && \
-    mv /opt/DynamoRIO-Linux-10.92.19975 /opt/dynamorio && \
+RUN wget -q "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-${DYNAMORIO_VERSION}/DynamoRIO-Linux-${DYNAMORIO_VERSION}.tar.gz" \
+        -O /tmp/dynamorio.tar.gz && \
+    mkdir -p ${DYNAMORIO_HOME} && \
+    tar -xzf /tmp/dynamorio.tar.gz -C ${DYNAMORIO_HOME} --strip-components=1 && \
     rm /tmp/dynamorio.tar.gz
 
+WORKDIR /build
+COPY syscall_filter.c test_open.c Makefile ./
+
+# Build client + test binary
+# DynamoRIO v11: libdrcontainers moved to ext/lib64/release; requires -DLINUX -DX86_64
+RUN DR=${DYNAMORIO_HOME} && \
+    gcc -shared -fPIC -O2 -Wall -Wextra \
+        -DLINUX -DX86_64 -include stdint.h \
+        -I${DR}/include -I${DR}/ext/include \
+        -Wl,-rpath,${DR}/lib64 \
+        -o syscall_filter.so syscall_filter.c \
+        -L${DR}/lib64/release -ldynamorio \
+        -L${DR}/ext/lib64/release -ldrcontainers && \
+    gcc -static -O2 -o test_open test_open.c
+
+# ── Runtime image ──────────────────────────────────────────────
+FROM --platform=linux/amd64 ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libunwind8 \
+        && rm -rf /var/lib/apt/lists/*
+
 ENV DYNAMORIO_HOME=/opt/dynamorio
-ENV PATH=$DYNAMORIO_HOME/bin64:$PATH
 
-WORKDIR /sandbox
+# Copy DynamoRIO runtime
+COPY --from=builder /opt/dynamorio /opt/dynamorio
 
-COPY . /sandbox/
+# Copy our built artifacts
+COPY --from=builder /build/syscall_filter.so /opt/sandbox/syscall_filter.so
+COPY --from=builder /build/test_open         /opt/sandbox/test_open
 
-RUN make client
+# Ensure sandbox base dir exists
+RUN mkdir -p /tmp/dr-sandbox
+
+# Default: show usage
+CMD ["bash", "-c", \
+     "echo 'Usage: docker run --rm -e DR_SESSION_ID=<id> dynamorio-sandbox \\'; \
+      echo '           /opt/dynamorio/bin64/drrun -c /opt/sandbox/syscall_filter.so -- <program>'"]
