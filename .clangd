@@ -1,0 +1,8 @@
+# .clangd
+#
+# Tells clangd to use compile_commands.json, which points syscall_filter.c at
+# host-stubs/ (a minimal stub of DynamoRIO's headers) so the IDE can parse the
+# file without errors.  The real DynamoRIO headers live inside the Docker image
+# at /opt/dynamorio/include/ and are used only during the actual build.
+CompileFlags:
+  CompilationDatabase: .

@@ -9,8 +9,12 @@
  * code at runtime using dynamic binary instrumentation (DBI).
  */
 
-#include "dr_api.h"
-#include "drsyms.h"
+/* DynamoRIO headers - available at compile time inside Docker (/opt/dynamorio/include/).
+ * clangd on the host will report "file not found" since the headers live only in the
+ * container; the actual build (make / build.sh) works correctly. */
+#include "dr_api.h"   /* NOLINT(build/include) */
+#include "drsyms.h"   /* NOLINT(build/include) */
+#include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
