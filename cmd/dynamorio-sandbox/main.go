@@ -1,132 +1,152 @@
-// cmd/dynamorio-sandbox/main.go
-//
-// Go wrapper that spawns a Docker container running an arbitrary command
-// under DynamoRIO syscall filtering.
+// cmd/dynamorio-sandbox/main.go – wrapper that runs a program inside the
+// DynamoRIO syscall-virtualization sandbox via Docker.
 //
 // Usage:
-//   go run ./cmd/dynamorio-sandbox/ -- <command> [args...]
-//   go run ./cmd/dynamorio-sandbox/ --image myimage -- /app/myprogram
+//
+//	dynamorio-sandbox --exec /bin/ls --args "/tmp" --timeout 30 \
+//	    --max-mem 256m --max-procs 5
 package main
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 )
 
 const (
-	defaultImage  = "dynamorio-sandbox-demo"
-	dynamorioHome = "/opt/dynamorio"
-	clientSO      = "/sandbox/syscall_filter.so"
+	defaultImage     = "dynamorio-sandbox"
+	drrunPath        = "/opt/dynamorio/bin64/drrun"
+	filterSOPath     = "/opt/sandbox/syscall_filter.so"
+	sandboxBaseInCtr = "/tmp/dr-sandbox"
 )
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `dynamorio-sandbox: run a command under DynamoRIO syscall filtering
-
-Usage:
-  dynamorio-sandbox [flags] -- <command> [args...]
-
-Flags:
-`)
-	flag.PrintDefaults()
-	fmt.Fprintf(os.Stderr, `
-Examples:
-  dynamorio-sandbox -- ./test_open
-  dynamorio-sandbox --image my-app -- /usr/bin/myprogram
-  dynamorio-sandbox --dry-run -- /bin/cat /etc/hosts
-`)
+func randomHex(n int) string {
+	b := make([]byte, n)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func main() {
-	image := flag.String("image", defaultImage, "Docker image to use")
-	dryRun := flag.Bool("dry-run", false, "Print docker command without executing")
-	memory := flag.String("memory", "256m", "Container memory limit")
-	cpus := flag.String("cpus", "1", "Container CPU limit")
-	flag.Usage = usage
+	execFlag    := flag.String("exec",      "",      "Program to execute inside the sandbox (required)")
+	argsFlag    := flag.String("args",      "",      "Space-separated arguments for the program")
+	timeoutFlag := flag.Duration("timeout", 30*time.Second, "Maximum execution time (e.g. 30s, 2m)")
+	memFlag     := flag.String("max-mem",  "256m",  "Container memory limit (e.g. 128m, 1g)")
+	procsFlag   := flag.Int("max-procs",   5,       "Maximum number of processes (--pids-limit)")
+	imageFlag   := flag.String("image",    defaultImage, "Docker image to use")
+	dryRunFlag  := flag.Bool("dry-run",   false,   "Print docker command without executing")
+	sessionFlag := flag.String("session",  "",      "Session ID (auto-generated if empty)")
 	flag.Parse()
 
-	args := flag.Args()
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "error: no command specified")
+	if *execFlag == "" {
+		fmt.Fprintln(os.Stderr, "error: --exec is required")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// Find the repo root to mount the client .so
-	scriptDir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	if err != nil {
-		scriptDir = "."
+	// Generate session ID
+	sessionID := *sessionFlag
+	if sessionID == "" {
+		sessionID = fmt.Sprintf("%d-%s", os.Getpid(), randomHex(4))
 	}
-	// Walk up to find proto-d-dynamorio directory
-	protoDir := findProtoDir(scriptDir)
 
-	// Build drrun command: drrun -c <client.so> -- <cmd> [args...]
-	drrunArgs := []string{
-		"drrun",
-		"-c", clientSO,
-		"--",
+	// Split args
+	var progArgs []string
+	if *argsFlag != "" {
+		progArgs = strings.Fields(*argsFlag)
 	}
-	drrunArgs = append(drrunArgs, args...)
 
 	// Build docker run command
 	dockerArgs := []string{
-		"docker", "run",
-		"--rm",
-		"--memory", *memory,
-		"--cpus", *cpus,
-		// No --privileged, no --cap-add SYS_PTRACE needed!
-		"--security-opt", "no-new-privileges",
+		"run", "--rm",
+		"--network=none",
+		fmt.Sprintf("--memory=%s", *memFlag),
+		fmt.Sprintf("--pids-limit=%d", *procsFlag),
+		"--security-opt", "seccomp=unconfined",
+		"--cap-drop", "ALL",
+		"-e", fmt.Sprintf("DR_SESSION_ID=%s", sessionID),
 	}
 
-	// Mount client .so if available locally
-	clientSOLocal := filepath.Join(protoDir, "syscall_filter.so")
-	if _, err := os.Stat(clientSOLocal); err == nil {
-		dockerArgs = append(dockerArgs,
-			"-v", fmt.Sprintf("%s:%s:ro", clientSOLocal, clientSO))
+	// Inner command: timeout + drrun + filter + -- program args
+	innerCmd := []string{
+		"timeout", fmt.Sprintf("%.0f", timeoutFlag.Seconds()),
+		drrunPath,
+		"-c", filterSOPath,
+		"--",
+		*execFlag,
 	}
+	innerCmd = append(innerCmd, progArgs...)
 
-	dockerArgs = append(dockerArgs, *image)
-	dockerArgs = append(dockerArgs, drrunArgs...)
+	dockerArgs = append(dockerArgs, *imageFlag)
+	dockerArgs = append(dockerArgs, innerCmd...)
 
-	fmt.Printf("[dynamorio-sandbox] Running under DynamoRIO syscall filter\n")
-	fmt.Printf("[dynamorio-sandbox] Image: %s\n", *image)
-	fmt.Printf("[dynamorio-sandbox] Command: %s\n", strings.Join(args, " "))
-	fmt.Printf("[dynamorio-sandbox] Docker: %s\n\n", strings.Join(dockerArgs, " "))
-
-	if *dryRun {
-		fmt.Println("[dynamorio-sandbox] Dry run - not executing")
+	if *dryRunFlag {
+		fmt.Printf("docker %s\n", strings.Join(dockerArgs, " "))
 		return
 	}
 
-	cmd := exec.Command(dockerArgs[0], dockerArgs[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
+	fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] session=%s exec=%s timeout=%s\n",
+		sessionID, *execFlag, *timeoutFlag)
 
-	if err := cmd.Run(); err != nil {
+	// Create a context with timeout + signal cancellation
+	ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag+5*time.Second)
+	defer cancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-sigCh:
+			fmt.Fprintf(os.Stderr, "\n[dynamorio-sandbox] caught %s – killing container\n", sig)
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
+
+	// Stream stdout/stderr
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = io.MultiWriter(os.Stderr, prefixWriter{prefix: "[sandbox] ", w: os.Stderr})
+
+	// Use the same process group so killpg works
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	start := time.Now()
+	err := cmd.Run()
+	elapsed := time.Since(start)
+
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] TIMEOUT after %s\n", elapsed.Round(time.Millisecond))
+			os.Exit(124)
+		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
 		fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] error: %v\n", err)
 		os.Exit(1)
 	}
+
+	fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] completed in %s\n", elapsed.Round(time.Millisecond))
 }
 
-// findProtoDir walks up from dir to find the proto-d-dynamorio directory.
-func findProtoDir(dir string) string {
-	for {
-		candidate := filepath.Join(dir, "syscall_filter.c")
-		if _, err := os.Stat(candidate); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			break
-		}
-		dir = parent
-	}
-	return "."
+// prefixWriter is intentionally a no-op here (stdout/stderr are already streamed).
+// We keep it for future per-line prefixing without allocation overhead.
+type prefixWriter struct {
+	prefix string
+	w      io.Writer
+}
+
+func (p prefixWriter) Write(b []byte) (int, error) {
+	// No-op duplicate: stdout/stderr already streamed above.
+	return len(b), nil
 }

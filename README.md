@@ -1,175 +1,128 @@
-# Proto-D: DynamoRIO Syscall Interception Sandbox
+# proto-d: DynamoRIO Syscall Virtualization
 
-This prototype demonstrates syscall interception using [DynamoRIO](https://dynamorio.org/),
-a runtime code manipulation framework that works via **dynamic binary instrumentation (DBI)**.
+A prototype sandbox using [DynamoRIO](https://dynamorio.org/) for **syscall virtualization** — not just allow/block, but intercepting syscalls and replacing them with safe, controlled behavior.
 
-## Why DynamoRIO Doesn't Need ptrace
-
-### Traditional ptrace-based sandboxing
-
-Tools like seccomp-bpf, strace, and many sandbox implementations rely on `ptrace` or kernel-level
-syscall filtering. In containerized environments (AWS Lambda, Firecracker), `ptrace` is typically
-**unavailable** because:
-
-- Lambda functions run without `CAP_SYS_PTRACE` capability
-- Nested ptrace (tracing inside a traced process) is blocked by the kernel
-- Container runtimes like runc strip dangerous capabilities by default
-
-### How DynamoRIO Works (No ptrace Required)
-
-DynamoRIO operates as a **Dynamic Binary Instrumentation (DBI) engine**:
+## Architecture
 
 ```
-Application binary
-      │
-      ▼
-DynamoRIO JIT compiler (in-process)
-      │  ├── Decodes basic blocks of application code
-      │  ├── Instruments each basic block (inserts callbacks)
-      │  └── Emits new native code to a "code cache"
-      ▼
-Modified code executes natively
-      │  └── Syscall instructions trigger pre/post callbacks
-      ▼
-syscall_filter.so (our client)
-      │  ├── pre_syscall: check allowlist
-      │  ├── ALLOWED → return true (syscall executes)
-      └── BLOCKED → set result=-EPERM, return false (syscall skipped)
+┌─────────────────────────────────────────────────────┐
+│  Docker container  (--network=none, --cap-drop ALL) │
+│                                                     │
+│  drrun  ──── JIT recompiles app ────────────────┐   │
+│              inserting pre-syscall hooks         │   │
+│                                                  ▼   │
+│              syscall_filter.so                       │
+│              ├── ALLOWED    → pass through           │
+│              ├── VIRTUALIZED→ rewrite args / result  │
+│              └── BLOCKED    → return -EPERM          │
+│                                                     │
+│  /tmp/dr-sandbox/<session-id>/   (isolated rootfs)  │
+└─────────────────────────────────────────────────────┘
 ```
 
-**Key insight**: DynamoRIO loads into the application process as a shared library (similar to
-`LD_PRELOAD`) and intercepts syscalls by rewriting the `syscall` instruction's surrounding code.
-No kernel cooperation, no ptrace, no special capabilities required.
+DynamoRIO operates **entirely in userspace** via JIT code rewriting — no `ptrace`, no kernel modules, no `CAP_SYS_PTRACE`. It intercepts every syscall instruction before it reaches the kernel.
 
-### Injection mechanism
+## Syscall Policy
 
-DynamoRIO uses `drrun` (or `libdynamorio.so` preloaded via `LD_PRELOAD`) to:
+### ALLOWED (pass-through)
 
-1. Set `LD_PRELOAD=libdynamorio.so` before the target process starts
-2. DynamoRIO's constructor takes control before `main()`
-3. All code execution goes through DynamoRIO's JIT engine
-4. Every `syscall` instruction is replaced with a call into DynamoRIO's dispatcher
-5. Our `event_pre_syscall` callback fires before each syscall
+| Syscall(s) | Reason |
+|---|---|
+| `read` | Basic I/O; capped at 1 MiB per call |
+| `exit`, `exit_group` | Must be allowed to terminate |
+| `brk`, `munmap`, `mremap` | Heap/memory management |
+| `futex` | Mutex/condvar for threading |
+| `clock_gettime`, `nanosleep` | Timing; no security risk |
+| `rt_sigaction`, `rt_sigreturn` | Signal handling |
+| `getpid`, `gettid` | Process identity (read-only) |
+| `getrandom` | Secure entropy; no side-channel risk |
+| `arch_prctl`, `prctl` | Stack/thread control; no privilege escalation |
+| `close`, `fstat`, `fcntl`, … | Operations on already-open fds |
 
-This is **entirely userspace** - no kernel modules, no ptrace, no special capabilities.
+### VIRTUALIZED (intercepted and replaced)
 
-## Syscall Allowlist
+| Syscall | Behavior | Security Reason |
+|---|---|---|
+| `open`, `openat`, `creat` | Path remapped to `/tmp/dr-sandbox/<session>/`; `/proc`, `/sys`, `/etc`, `/dev`, `/home`, … rejected with EPERM | Prevents host filesystem exfiltration and credential access |
+| `write`, `writev` | Only `fd 1` (stdout) and `fd 2` (stderr) allowed; others → EPERM | Prevents writing to sockets, pipes, or other processes' files |
+| `read`, `pread64` | Allowed but capped at **1 MiB per call** | Prevents I/O amplification and DoS via huge reads |
+| `socket`, `connect`, `bind`, `listen`, … | Return `-ENETDOWN` | No network access; isolation from C2, exfiltration |
+| `execve`, `execveat` | Return `-EPERM` | No exec chain; sandbox cannot spawn unsandboxed children |
+| `fork`, `vfork`, `clone` (new process) | Counted; return `-EAGAIN` after **5 processes** | Prevents fork bombs and resource exhaustion |
+| `mmap(PROT_EXEC)` | Return `-EPERM` | Blocks JIT compilers and shellcode injection |
+| `mprotect(PROT_EXEC)` | Return `-EPERM` | Blocks RWX page tricks used in exploitation |
 
-The filter permits only these syscalls:
+### BLOCKED (everything else → `-EPERM`)
 
-| Syscall | Number | Reason |
-|---------|--------|--------|
-| `read` | 0 | Read from fd |
-| `write` | 1 | Write to fd |
-| `exit` | 60 | Process exit |
-| `exit_group` | 231 | Thread group exit |
-| `brk` | 12 | Heap management |
-| `mmap` | 9 | Memory mapping |
-| `mprotect` | 10 | Memory protection |
-| `munmap` | 11 | Unmap memory |
-| `futex` | 202 | Thread synchronization |
-| `clock_gettime` | 228 | Time queries |
-| `rt_sigaction` | 13 | Signal handling |
-| `rt_sigreturn` | 15 | Signal return |
+All syscalls not explicitly listed above are blocked. This includes:
+- `ptrace` (would escape the sandbox)
+- `mount`, `chroot`, `pivot_root` (namespace manipulation)
+- `setuid`, `setgid`, `capset` (privilege escalation)
+- `kexec_load`, `init_module` (kernel code execution)
+- `bpf` (eBPF program loading)
+- `io_uring_*` (async I/O that bypasses filter)
 
-All other syscalls (including `open`, `openat`, `socket`, `connect`, `execve`, etc.)
-return `-EPERM` immediately without executing.
+## Session Management
 
-## Lambda Feasibility Analysis
-
-### What works
-
-DynamoRIO's LD_PRELOAD injection mode is **viable in Lambda** because:
-
-1. **No ptrace needed**: Lambda functions can't use ptrace, but DynamoRIO doesn't need it
-2. **No kernel modules**: Pure userspace DBI, no `/dev/kvm` or similar
-3. **No special capabilities**: Works with standard Lambda IAM execution role
-4. **Low overhead**: ~5-15% runtime overhead (much less than ptrace-based tools)
-5. **Firecracker compatible**: Works inside the MicroVM that Lambda uses
-
-### Challenges
-
-| Challenge | Severity | Mitigation |
-|-----------|----------|------------|
-| Binary size | Medium | DynamoRIO adds ~20MB; use Lambda layers |
-| Cold start latency | Medium | DynamoRIO JIT adds ~50-200ms startup |
-| Self-modifying code | Low | DynamoRIO handles most cases |
-| Static binaries | Low | DynamoRIO supports static binaries |
-| Multi-threaded programs | Medium | Requires careful allowlist tuning |
-
-### Architecture for Lambda deployment
+Each sandbox run gets a unique **session ID** (auto-generated from PID + random bytes, or supplied via `DR_SESSION_ID`):
 
 ```
-Lambda function
-├── /opt/dynamorio/          (Lambda layer)
-│   ├── bin64/drrun
-│   └── lib64/release/libdynamorio.so
-├── /opt/sandbox/
-│   └── syscall_filter.so    (Lambda layer)
-└── handler.py               (wraps subprocess call through drrun)
+/tmp/dr-sandbox/
+└── <session-id>/        ← isolated directory for this run
+    ├── <any files the sandboxed program creates>
 ```
 
-The Lambda handler would invoke user code as:
-```
-drrun -c /opt/sandbox/syscall_filter.so -- /path/to/user/binary
+The Go wrapper auto-generates the session ID; pass `--session` to fix it for reproducible tests.
+
+**Cleanup**: the container is run with `--rm`, so all files inside the container (including `/tmp/dr-sandbox/<session-id>/`) are destroyed on exit.
+
+## Quick Start
+
+```bash
+# Build image
+make docker-build
+
+# Run the demo (test_open tries to open /etc/passwd)
+make demo
+
+# Run an arbitrary program
+make docker-run EXEC=/bin/ls EXEC_ARGS="/tmp"
+
+# Use the Go wrapper
+go run ./cmd/dynamorio-sandbox --exec /bin/ls --args "/tmp" --timeout 10s
 ```
 
-### vs. seccomp-bpf
+## Go Wrapper
+
+```
+dynamorio-sandbox [flags]
+
+  --exec      string    Program to run (required)
+  --args      string    Space-separated arguments
+  --timeout   duration  Max execution time (default 30s)
+  --max-mem   string    Memory limit (default 256m)
+  --max-procs int       Max pids-limit (default 5)
+  --image     string    Docker image (default dynamorio-sandbox)
+  --session   string    Session ID (auto-generated)
+  --dry-run             Print docker command, don't run
+```
+
+## Comparison with seccomp-bpf
 
 | Feature | seccomp-bpf | DynamoRIO |
-|---------|-------------|-----------|
-| Requires ptrace | No (kernel) | No (userspace) |
-| Requires CAP_SYS_ADMIN | For filter install | No |
-| Works in Lambda | Depends on runtime | Yes |
-| Performance overhead | ~1% | ~5-15% |
-| Granularity | Per-syscall | Per-syscall + instruction |
-| Argument inspection | Limited (BPF) | Full access |
-| Portability | Linux only | Linux/Windows/Mac |
+|---|---|---|
+| Kernel required | Yes (Linux 3.5+) | No |
+| Argument inspection | Partial (BPF can read args) | Full (arbitrary C logic) |
+| Argument rewriting | No | Yes |
+| Path remapping | No | Yes |
+| Return value spoofing | No | Yes |
+| Userspace only | No | Yes |
+| Lambda/Fargate compatible | With permissions | Yes |
 
-DynamoRIO's main advantage over seccomp-bpf in Lambda is that it operates entirely in userspace
-without requiring any kernel-level filter installation, making it suitable for environments where
-you can't control the kernel security policy.
+DynamoRIO's main advantage is **argument rewriting** — we can transparently redirect file paths into the sandbox directory without the application knowing. seccomp can only observe, not mutate.
 
-## Usage
+## Limitations (Prototype)
 
-### Build
-
-```bash
-# Build everything inside Docker
-./build.sh
-```
-
-### Demo
-
-```bash
-# Run the full demonstration
-./demo.sh
-```
-
-### Go wrapper
-
-```bash
-# Run an arbitrary command under DynamoRIO syscall filtering
-go run ./cmd/dynamorio-sandbox/ -- ./test_open
-
-# Dry run (see docker command without executing)
-go run ./cmd/dynamorio-sandbox/ --dry-run -- /usr/bin/python3 -c "import os; os.open('/etc/passwd', 0)"
-```
-
-### Manual Docker usage
-
-```bash
-docker build -t dynamorio-sandbox-demo .
-docker run --rm dynamorio-sandbox-demo bash -c \
-    "cd /sandbox && make && drrun -c syscall_filter.so -- ./test_open"
-```
-
-## Expected Output
-
-```
-[syscall-filter] DynamoRIO syscall filter loaded
-[syscall-filter] Allowlist: read/write/exit/exit_group/brk/mmap/mprotect/munmap/futex/clock_gettime/rt_sigaction/rt_sigreturn
-test_open: attempting open("/etc/passwd", O_RDONLY)...
-[syscall-filter] BLOCKED syscall 2 (open) -> EPERM
-test_open: open() returned EPERM (errno=1) - correctly blocked!
-```
+- Path remapping patches app memory in-place; if the remapped path is longer than the original, we allocate via DynamoRIO's heap and patch the register (and leak it — acceptable for a prototype).
+- `io_uring` is blocked because it bypasses the pre-syscall hook mechanism.
+- `fork` counting uses a simple integer; in a multi-threaded app, the mutex makes it correct but non-atomic with the kernel's actual process creation.

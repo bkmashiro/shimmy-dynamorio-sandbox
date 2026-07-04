@@ -6,3 +6,7 @@
 # at /opt/dynamorio/include/ and are used only during the actual build.
 CompileFlags:
   CompilationDatabase: .
+  Add:
+    - -Ihost-stubs
+    - -include
+    - host-stubs/dr_api.h
