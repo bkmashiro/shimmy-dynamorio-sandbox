@@ -485,6 +485,18 @@ static bool read_app_string(void *drcontext, reg_t ptr, char *buf, size_t bufsz)
 /* ══════════════════════════════════════════════════════════════
  *  PRE-SYSCALL EVENT
  * ══════════════════════════════════════════════════════════════ */
+/* Ask DynamoRIO to deliver syscall callbacks for every app syscall.  Without a
+ * filter event, pre/post syscall events are only delivered for syscalls DR
+ * already needs to intercept internally, so policy code may appear to load but
+ * never see open/openat.
+ */
+static bool event_filter_syscall(void *drcontext, int sysnum)
+{
+    (void)drcontext;
+    (void)sysnum;
+    return true;
+}
+
 static bool event_pre_syscall(void *drcontext, int sysnum)
 {
     /* ── ALWAYS ALLOWED ──────────────────────────────────────── */
@@ -752,9 +764,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
         strncpy(g_session_id, env_sid, sizeof(g_session_id) - 1);
     } else {
         /* generate from PID + timestamp */
-        uint64 ts;
-        dr_get_time(NULL);   /* warm up */
-        ts = dr_get_milliseconds();
+        uint64 ts = dr_get_milliseconds();
         dr_snprintf(g_session_id, sizeof(g_session_id),
                     "%u-%llu", dr_get_process_id(), (unsigned long long)ts);
     }
@@ -769,6 +779,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
 
     g_mutex = dr_mutex_create();
 
+    dr_register_filter_syscall_event(event_filter_syscall);
     dr_register_pre_syscall_event(event_pre_syscall);
 
     LOG("syscall virtualization active - sandbox: %s", g_sandbox_root);
