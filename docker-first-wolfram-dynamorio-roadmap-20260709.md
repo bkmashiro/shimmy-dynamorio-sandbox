@@ -34,7 +34,7 @@ The redirected path is under:
 /tmp/dr-sandbox/<session-id>/...
 ```
 
-This gives each run disposable runtime state while preserving the program's normal ability to write temp/cache files.
+`DR_AUDIT_JSONL=1` emits machine-readable JSONL audit events for path/syscall observations. This is the feed for deriving later candidate policies from real Wolfram traces instead of hand-guessing syscall allowlists.
 
 ## Verification
 
@@ -43,11 +43,12 @@ Local Docker Desktop on Apple Silicon is useful for building the image but **not
 Verified on AWS CodeBuild native x86_64 Linux:
 
 ```text
-BUILD_ID=shimmy-dynamorio-docker-smoke:75ab9ffa-f7ac-4fd0-8ae4-676567ee0906
+BUILD_ID=shimmy-dynamorio-docker-smoke:baac6a86-7237-4ceb-bf57-e178b7fa94b4
 status=passed
 checks:
   - make docker-build
   - make smoke-private-tmp
+  - make smoke-audit-jsonl
   - make demo
 ```
 

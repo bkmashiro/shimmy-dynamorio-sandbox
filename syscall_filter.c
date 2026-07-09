@@ -347,6 +347,7 @@ static char           g_session_id[64];
 static char           g_sandbox_root[256];   /* /tmp/dr-sandbox/<session-id>/ */
 static sandbox_mode_t g_mode = MODE_OBSERVE;
 static bool           g_redirect_tmp = true;
+static bool           g_audit_jsonl = false;
 static int            g_proc_count = 0;
 static void          *g_mutex;
 
@@ -355,6 +356,58 @@ static file_t         g_log;                 /* DynamoRIO file handle for stderr
 /* ── logging helper ──────────────────────────────────────────── */
 #define LOG(fmt, ...) \
     dr_fprintf(g_log, "[dr-sandbox][%s] " fmt "\n", g_session_id, ##__VA_ARGS__)
+
+static void audit_json_string(const char *s)
+{
+    dr_fprintf(g_log, "\"");
+    for (const unsigned char *p = (const unsigned char *)s; p && *p; p++) {
+        unsigned char c = *p;
+        switch (c) {
+            case '\\': dr_fprintf(g_log, "\\\\"); break;
+            case '"':  dr_fprintf(g_log, "\\\""); break;
+            case '\n': dr_fprintf(g_log, "\\n"); break;
+            case '\r': dr_fprintf(g_log, "\\r"); break;
+            case '\t': dr_fprintf(g_log, "\\t"); break;
+            default:
+                if (c < 0x20)
+                    dr_fprintf(g_log, "\\u%04x", c);
+                else
+                    dr_fprintf(g_log, "%c", c);
+        }
+    }
+    dr_fprintf(g_log, "\"");
+}
+
+static void audit_path_event(const char *action, int sysnum, const char *label,
+                             const char *path, const char *remapped)
+{
+    if (!g_audit_jsonl)
+        return;
+    dr_fprintf(g_log, "{\"type\":\"path\",\"session\":");
+    audit_json_string(g_session_id);
+    dr_fprintf(g_log, ",\"mode\":\"%s\",\"action\":", g_mode == MODE_STRICT ? "strict" : "observe");
+    audit_json_string(action);
+    dr_fprintf(g_log, ",\"syscall\":%d,\"label\":", sysnum);
+    audit_json_string(label);
+    dr_fprintf(g_log, ",\"path\":");
+    audit_json_string(path);
+    if (remapped && *remapped) {
+        dr_fprintf(g_log, ",\"remapped\":");
+        audit_json_string(remapped);
+    }
+    dr_fprintf(g_log, "}\n");
+}
+
+static void audit_syscall_event(const char *action, int sysnum)
+{
+    if (!g_audit_jsonl)
+        return;
+    dr_fprintf(g_log, "{\"type\":\"syscall\",\"session\":");
+    audit_json_string(g_session_id);
+    dr_fprintf(g_log, ",\"mode\":\"%s\",\"action\":", g_mode == MODE_STRICT ? "strict" : "observe");
+    audit_json_string(action);
+    dr_fprintf(g_log, ",\"syscall\":%d}\n", sysnum);
+}
 
 /* ── path canonicalization: resolve ".." components in-place ─── */
 /*
@@ -529,6 +582,7 @@ static bool remap_private_path_param(void *drcontext, int sysnum, int param_inde
         ensure_parent_dirs(remapped);
 
     LOG("REMAP %s syscall=%d param=%d: %s -> %s", label, sysnum, param_index, orig, remapped);
+    audit_path_event("remap", sysnum, label, orig, remapped);
     if (strlen(remapped) <= strlen(orig)) {
         if (!dr_safe_write((void *)(uintptr_t)path_arg, strlen(remapped) + 1,
                            remapped, NULL)) {
@@ -750,8 +804,10 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
 
         bool should_redirect = g_redirect_tmp && path_is_private_write_candidate(orig);
         if (!should_redirect) {
-            if (g_mode == MODE_OBSERVE)
+            if (g_mode == MODE_OBSERVE) {
                 LOG("OBSERVE open: %s flags=0x%x", orig, flags);
+                audit_path_event("observe", sysnum, "open", orig, NULL);
+            }
             return true;
         }
 
@@ -763,6 +819,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         if (open_flags_write_intent(flags))
             ensure_parent_dirs(remapped);
         LOG("REMAP private open: %s -> %s flags=0x%x", orig, remapped, flags);
+        audit_path_event("remap", sysnum, "open", orig, remapped);
 
         if (strlen(remapped) <= strlen(orig)) {
             if (!dr_safe_write((void *)(uintptr_t)path_arg, strlen(remapped) + 1,
@@ -835,6 +892,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
      */
     if (g_mode == MODE_OBSERVE) {
         LOG("OBSERVE syscall %d", sysnum);
+        audit_syscall_event("observe", sysnum);
         return true;
     }
 
@@ -987,6 +1045,12 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
          strcmp(env_redirect_tmp, "no") == 0))
         g_redirect_tmp = false;
 
+    const char *env_audit_jsonl = getenv("DR_AUDIT_JSONL");
+    if (env_audit_jsonl && *env_audit_jsonl &&
+        strcmp(env_audit_jsonl, "0") != 0 && strcmp(env_audit_jsonl, "false") != 0 &&
+        strcmp(env_audit_jsonl, "no") != 0)
+        g_audit_jsonl = true;
+
     ensure_private_dirs();
 
     g_mutex = dr_mutex_create();
@@ -994,7 +1058,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_register_filter_syscall_event(event_filter_syscall);
     dr_register_pre_syscall_event(event_pre_syscall);
 
-    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s",
+    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s audit_jsonl=%s",
         g_sandbox_root, g_mode == MODE_STRICT ? "strict" : "observe",
-        g_redirect_tmp ? "true" : "false");
+        g_redirect_tmp ? "true" : "false", g_audit_jsonl ? "true" : "false");
 }

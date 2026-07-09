@@ -13,6 +13,7 @@ This prototype now supports two runtime modes:
 | `DR_SANDBOX_MODE=observe` | Compatibility-first: log syscalls, pass most through, and redirect private writable temp/cache paths when enabled. This is the default for complex runtimes such as Wolfram. |
 | `DR_SANDBOX_MODE=strict` / `enforce` | Original deny-by-default sandbox policy. Useful as a canary, too restrictive for Wolfram first-pass integration. |
 | `DR_REDIRECT_TMP=1` | Redirect write/create opens under `/tmp`, `/var/tmp`, `/.Wolfram`, and `/.cache` into `/tmp/dr-sandbox/<session-id>/...`. |
+| `DR_AUDIT_JSONL=1` | Emit machine-readable JSONL audit records for observed/remapped path/syscall events. |
 
 Use observe mode first, then derive a narrower enforce profile from logs. Do not start by blocking everything: Wolfram may legitimately write license/cache/paclet/temp files.
 
@@ -103,6 +104,9 @@ make demo
 
 # Verify observe-mode private tmp redirection on native x86_64/CodeBuild
 make smoke-private-tmp
+
+# Verify JSONL audit output on native x86_64/CodeBuild
+make smoke-audit-jsonl
 
 # Run an arbitrary program in observe mode
 make docker-run EXEC=/bin/ls EXEC_ARGS="/tmp"

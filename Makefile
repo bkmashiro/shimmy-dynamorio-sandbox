@@ -24,7 +24,7 @@ MAX_PROCS      ?= 5
 DR_MODE        ?= observe
 DR_REDIRECT_TMP ?= 1
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl clean
 
 all: client test-prog
 
@@ -97,6 +97,17 @@ smoke-private-tmp: docker-build
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    bash -lc 'rm -rf /tmp/shimmy-dr-vfs /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_tmp_write; test ! -e /tmp/shimmy-dr-vfs; test ! -e /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs'
+
+# Verify machine-readable JSONL audit output for downstream profile generation.
+smoke-audit-jsonl: docker-build
+	docker run --rm \
+	    -e DR_SESSION_ID=audit-smoke \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_REDIRECT_TMP=1 \
+	    -e DR_AUDIT_JSONL=1 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -lc 'rm -rf /tmp/shimmy-dr-vfs /tmp/dr-sandbox/audit-smoke/tmp/shimmy-dr-vfs; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_tmp_write 2>/tmp/audit.log; grep -q "^{\"type\":\"path\"" /tmp/audit.log; grep -q "\"action\":\"remap\"" /tmp/audit.log; grep -q "\"path\":\"/tmp/shimmy-dr-vfs\"" /tmp/audit.log; grep -q "\"path\":\"/tmp/shimmy-dr-vfs/side-effect.txt\"" /tmp/audit.log; grep -q "\"remapped\":\"/tmp/dr-sandbox/audit-smoke/" /tmp/audit.log; echo audit jsonl ok $$(grep -c "^{" /tmp/audit.log)'
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 
