@@ -29,6 +29,20 @@ Use observe mode first, then derive a narrower enforce profile from logs. Do not
 
 Use native x86_64 CodeBuild/Lambda-style probes as the runtime gate. Local Docker on Apple Silicon is useful for image/build checks, but amd64-on-arm64 emulation is not a valid DynamoRIO runtime gate.
 
+## Transparent evaluator mode
+
+This project is **not** an OJ RPC runner. The intended integration is a transparent attach layer for existing evaluators: the caller keeps its current argv/env/stdin/stdout/stderr/files/exit-code contract, and a launcher/config switch prepends DynamoRIO under the hood.
+
+Target adoption shape:
+
+```bash
+EVALUATOR_SANDBOX=dr evaluator arg1 arg2 < input.txt > output.txt
+```
+
+or equivalent host config. The DR client owns syscall policy, fd tracking, network policy, resource guards, and audit. Carriers such as Docker, CodeBuild, or Lambda only launch and package the evaluator; they must not become the policy layer.
+
+Roadmap: [`docs/plans/2026-07-09-transparent-evaluator-sandbox-roadmap.md`](docs/plans/2026-07-09-transparent-evaluator-sandbox-roadmap.md).
+
 ## Architecture
 
 ```
