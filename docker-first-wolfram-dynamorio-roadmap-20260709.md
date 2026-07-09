@@ -79,10 +79,12 @@ test_open: open() returned EPERM (errno=1) - correctly blocked!
 
 ## Next executable slices
 
-1. Add a Wolfram/LambdaFeedback Docker probe that compares no-DR vs DR observe mode for the same handler input/output.
-2. Feed the JSONL audit output from real Wolfram traces into a candidate profile summarizer.
+1. Feed the JSONL audit output from real Wolfram traces into a candidate profile summarizer.
+2. Re-run the Wolfram/LambdaFeedback Docker probe with a licensing environment that makes the evaluator baseline pass, then promote evaluator parity to required.
 3. Expand private path coverage beyond temp/cache if Wolfram traces reveal other mutable state roots.
 4. Only after correctness: collect rough cold container vs warm process timing.
+
+The first Docker Wolfram/LambdaFeedback probe skeleton now lives under `probe-docker/wolfram-lf-dynamorio-observe/`; the first required-gate run passed launcher parity (`wolframscript -version`) and produced JSONL audit rows, while evaluator startup failed equally with and without DR due to missing activation/license in generic CI.
 
 ## Non-goals unless explicitly requested
 
