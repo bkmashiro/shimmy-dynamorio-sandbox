@@ -1,0 +1,10 @@
+.DS_Store
+.cache/
+compile_commands.json
+bin/
+*.o
+*.so
+test_open
+test_tmp_write
+test_runtime_controls
+dynamorio-sandbox
