@@ -7,4 +7,4 @@ bin/
 test_open
 test_tmp_write
 test_runtime_controls
-dynamorio-sandbox
+/dynamorio-sandbox

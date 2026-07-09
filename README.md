@@ -158,20 +158,31 @@ go run ./cmd/dynamorio-sandbox --exec /bin/ls --args "/tmp" --timeout 10s
 ## Go Wrapper
 
 ```
-dynamorio-sandbox [flags]
+  Preferred transparent form:
 
-  --exec      string    Program to run (required)
-  --args      string    Space-separated arguments
+    dynamorio-sandbox [flags] -- <program> [args...]
+
+  Legacy form:
+
+    dynamorio-sandbox --exec <program> --args '<args>' [flags]
+
   --timeout   duration  Max execution time (default 30s)
+  --policy-file string  Env-style DR policy file
+  --env KEY=VALUE       Evaluator environment variable; repeatable
+  --pass-env KEY        Pass one host environment variable into the carrier; repeatable
+  --workdir string      Evaluator cwd to bind-mount/use inside the carrier (default current dir)
+  --verbose             Print wrapper status; default is quiet/transparent
   --max-mem   string    DR allocation budget / DR_MAX_ALLOC_BYTES, e.g. 256m (default unlimited)
   --max-procs int       DR process limit / DR_MAX_PROCS (default client value)
   --mode      string    DR mode: observe or strict (default observe)
   --path-policy string  DR_PATH_POLICY rules, e.g. ro:/data;private:/tmp/work;block:/secrets
-  --network-policy string    Network policy override: allow or block
+  --network-policy string    allow/block or fine rules, e.g. allow:127.0.0.1:9;block:*
   --exec-policy string       execve policy override: allow or block
   --prot-exec-policy string  Executable-memory policy override: allow or block
-  --file-write-policy string fd write policy override: allow or block/stdio
+  --file-write-policy string allow/block or fd rules, e.g. block:/tmp/out
   --max-read-bytes string    Per-read cap, e.g. 1m or 4096
+  --audit-path string        Side-channel DR audit JSONL file
+  --semantic-audit           Enable semantic audit JSONL
   --dr-max-procs int         Alias for --max-procs / DR_MAX_PROCS
   --image     string    Docker image (default dynamorio-sandbox)
   --session   string    Session ID (auto-generated)

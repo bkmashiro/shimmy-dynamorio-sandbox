@@ -103,6 +103,8 @@ Required transparency rules:
 
 ## Phase 1 — Transparent launcher contract
 
+**Status:** Initial Docker-carrier slice implemented. The wrapper now accepts `dynamorio-sandbox [flags] -- evaluator args...`, loads env-style policy files, passes explicit evaluator env values, bind-mounts/uses the evaluator workdir, stays quiet by default, and has CodeBuild smokes for stdio, exit-code, cwd, and env transparency.
+
 **Objective:** Make enabling DR a one-env/config change around an existing evaluator command.
 
 **Files:**

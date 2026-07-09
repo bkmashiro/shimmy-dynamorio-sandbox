@@ -33,7 +33,7 @@ DR_MAX_READ_BYTES ?=
 DR_MAX_ALLOC_BYTES ?=
 DR_MAX_PROCS   ?=
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env clean
 
 all: client test-prog
 
@@ -232,6 +232,15 @@ smoke-runtime-config: docker-build
 
 go-build:
 	cd cmd/dynamorio-sandbox && go build -o ../../bin/dynamorio-sandbox .
+
+smoke-transparent-stdio: go-build docker-build
+	bash -euo pipefail -c 'tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; printf "DR_HUMAN_LOG=0\n" >$$tmp/policy.env; printf "ping\n" | ./bin/dynamorio-sandbox --timeout 10s --policy-file $$tmp/policy.env --env EVALUATOR_MARK=ok --workdir "$$(pwd)" -- /bin/bash -lc '\''read x; printf "out:%s\\n" "$$x"; printf "err:%s\\n" "$$EVALUATOR_MARK" >&2'\'' >$$tmp/out 2>$$tmp/err; grep -qx "out:ping" $$tmp/out; grep -qx "err:ok" $$tmp/err; echo transparent stdio ok'
+
+smoke-transparent-exit-code: go-build docker-build
+	bash -euo pipefail -c 'tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; printf "DR_HUMAN_LOG=0\n" >$$tmp/policy.env; set +e; ./bin/dynamorio-sandbox --timeout 10s --policy-file $$tmp/policy.env --workdir "$$(pwd)" -- /bin/bash -lc '\''exit 7'\'' >$$tmp/out 2>$$tmp/err; rc=$$?; set -e; test $$rc -eq 7; test ! -s $$tmp/out; test ! -s $$tmp/err; echo transparent exit-code ok'
+
+smoke-transparent-cwd-env: go-build docker-build
+	bash -euo pipefail -c 'tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; printf "DR_HUMAN_LOG=0\n" >$$tmp/policy.env; ./bin/dynamorio-sandbox --timeout 10s --policy-file $$tmp/policy.env --env EVALUATOR_MARK=ok --workdir "$$(pwd)" -- /bin/bash -lc '\''test "$$PWD" = "'"$$(pwd)"'"; test "$$EVALUATOR_MARK" = ok; test -f README.md; printf cwd-env-ok'\'' >$$tmp/out; grep -qx cwd-env-ok $$tmp/out; echo transparent cwd/env ok'
 
 ## ── cleanup ─────────────────────────────────────────────────────
 

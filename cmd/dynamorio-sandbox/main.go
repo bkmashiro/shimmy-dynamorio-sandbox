@@ -1,22 +1,26 @@
-// cmd/dynamorio-sandbox/main.go – wrapper that runs a program inside the
-// DynamoRIO syscall-virtualization sandbox via Docker.
+// cmd/dynamorio-sandbox/main.go – transparent wrapper that runs a program
+// under the DynamoRIO syscall-virtualization sandbox via a Docker carrier.
 //
-// Usage:
+// Preferred usage:
 //
-//	dynamorio-sandbox --exec /bin/ls --args "/tmp" --timeout 30 \
-//	    --max-mem 256m --max-procs 5
+//	dynamorio-sandbox [flags] -- /path/to/evaluator arg1 arg2
+//
+// Legacy usage with --exec/--args is still accepted for compatibility.
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -29,104 +33,280 @@ const (
 	sandboxBaseInCtr = "/tmp/dr-sandbox"
 )
 
+type sandboxConfig struct {
+	Exec         string
+	Args         []string
+	Timeout      time.Duration
+	Mem          string
+	Procs        int
+	Image        string
+	DryRun       bool
+	SessionID    string
+	Mode         string
+	RedirectTmp  bool
+	PolicyFile   string
+	Verbose      bool
+	Workdir      string
+	EvaluatorEnv map[string]string
+	Env          map[string]string
+}
+
 func randomHex(n int) string {
 	b := make([]byte, n)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-func main() {
-	execFlag := flag.String("exec", "", "Program to execute inside the sandbox (required)")
-	argsFlag := flag.String("args", "", "Space-separated arguments for the program")
-	timeoutFlag := flag.Duration("timeout", 30*time.Second, "Maximum execution time (e.g. 30s, 2m)")
-	memFlag := flag.String("max-mem", "", "DR allocation budget via DR_MAX_ALLOC_BYTES (e.g. 128m, 1g); empty = unlimited")
-	procsFlag := flag.Int("max-procs", 0, "DR process limit via DR_MAX_PROCS; 0 = client default")
-	imageFlag := flag.String("image", defaultImage, "Docker image to use")
-	dryRunFlag := flag.Bool("dry-run", false, "Print docker command without executing")
-	sessionFlag := flag.String("session", "", "Session ID (auto-generated if empty)")
-	modeFlag := flag.String("mode", "observe", "DR sandbox mode: observe or strict")
-	redirectTmpFlag := flag.Bool("redirect-tmp", true, "Redirect private temp/cache writes into the session VFS")
-	pathPolicyFlag := flag.String("path-policy", "", "DR_PATH_POLICY rules, e.g. ro:/data;private:/tmp/work;block:/secrets")
-	networkFlag := flag.String("network-policy", "", "Network policy override: allow or block")
-	execPolicyFlag := flag.String("exec-policy", "", "execve policy override: allow or block")
-	protExecFlag := flag.String("prot-exec-policy", "", "Executable-memory policy override: allow or block")
-	fileWriteFlag := flag.String("file-write-policy", "", "File-write policy override: allow or block/stdio")
-	maxReadBytesFlag := flag.String("max-read-bytes", "", "Per-read cap passed to DR_MAX_READ_BYTES, e.g. 1m or 4096")
-	drMaxProcsFlag := flag.Int("dr-max-procs", 0, "Alias for --max-procs; passed to DR_MAX_PROCS")
-	flag.Parse()
-
-	if *execFlag == "" {
-		fmt.Fprintln(os.Stderr, "error: --exec is required")
-		flag.Usage()
-		os.Exit(1)
+func parseCLI(args []string) (sandboxConfig, error) {
+	cfg := sandboxConfig{
+		Timeout:      30 * time.Second,
+		Image:        defaultImage,
+		Mode:         "observe",
+		RedirectTmp:  true,
+		EvaluatorEnv: map[string]string{},
+		Env:          map[string]string{},
 	}
 
-	// Generate session ID
-	sessionID := *sessionFlag
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("%d-%s", os.Getpid(), randomHex(4))
+	fs := flag.NewFlagSet("dynamorio-sandbox", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	legacyExec := fs.String("exec", "", "Program to execute inside the sandbox")
+	legacyArgs := fs.String("args", "", "Space-separated arguments for the program")
+	fs.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "Maximum execution time (e.g. 30s, 2m)")
+	fs.StringVar(&cfg.Mem, "max-mem", "", "DR allocation budget via DR_MAX_ALLOC_BYTES (e.g. 128m, 1g); empty = unlimited")
+	fs.IntVar(&cfg.Procs, "max-procs", 0, "DR process limit via DR_MAX_PROCS; 0 = client default")
+	fs.StringVar(&cfg.Image, "image", cfg.Image, "Docker image to use")
+	fs.BoolVar(&cfg.DryRun, "dry-run", false, "Print docker command without executing")
+	fs.StringVar(&cfg.SessionID, "session", "", "Session ID (auto-generated if empty)")
+	fs.StringVar(&cfg.Mode, "mode", cfg.Mode, "DR sandbox mode: observe or strict")
+	fs.BoolVar(&cfg.RedirectTmp, "redirect-tmp", cfg.RedirectTmp, "Redirect private temp/cache writes into the session VFS")
+	fs.StringVar(&cfg.PolicyFile, "policy-file", "", "Path to env-style DR policy file")
+	fs.BoolVar(&cfg.Verbose, "verbose", false, "Print wrapper status messages to stderr")
+	fs.StringVar(&cfg.Workdir, "workdir", "", "Evaluator working directory to bind-mount and use inside the carrier (default: current directory)")
+	evaluatorEnvValues := multiFlag{}
+	passEnvValues := multiFlag{}
+	fs.Var(&evaluatorEnvValues, "env", "Evaluator env KEY=VALUE; may be repeated")
+	fs.Var(&passEnvValues, "pass-env", "Pass host env KEY into the evaluator carrier; may be repeated")
+
+	pathPolicy := fs.String("path-policy", "", "DR_PATH_POLICY rules, e.g. ro:/data;private:/tmp/work;block:/secrets")
+	networkPolicy := fs.String("network-policy", "", "Network policy: allow/block or fine rules such as allow:127.0.0.1:9;block:*")
+	execPolicy := fs.String("exec-policy", "", "execve policy override: allow or block")
+	protExecPolicy := fs.String("prot-exec-policy", "", "Executable-memory policy override: allow or block")
+	fileWritePolicy := fs.String("file-write-policy", "", "File-write policy override: allow, block/stdio, or block:/path for fd policy")
+	maxReadBytes := fs.String("max-read-bytes", "", "Per-read cap passed to DR_MAX_READ_BYTES, e.g. 1m or 4096")
+	drMaxProcs := fs.Int("dr-max-procs", 0, "Alias for --max-procs; passed to DR_MAX_PROCS")
+	auditPath := fs.String("audit-path", "", "Write DR audit JSONL to this side-channel path")
+	semanticAudit := fs.Bool("semantic-audit", false, "Enable semantic audit JSONL events")
+
+	if err := fs.Parse(args); err != nil {
+		return cfg, err
 	}
 
-	// Split args
-	var progArgs []string
-	if *argsFlag != "" {
-		progArgs = strings.Fields(*argsFlag)
-	}
-
-	// Build docker run command
-	dockerArgs := []string{
-		"run", "--rm",
-		"--security-opt", "seccomp=unconfined",
-		"--cap-drop", "ALL",
-		"-e", fmt.Sprintf("DR_SESSION_ID=%s", sessionID),
-		"-e", fmt.Sprintf("DR_SANDBOX_MODE=%s", *modeFlag),
-		"-e", fmt.Sprintf("DR_REDIRECT_TMP=%t", *redirectTmpFlag),
-	}
-	optionalEnv := [][2]string{
-		{"DR_PATH_POLICY", *pathPolicyFlag},
-		{"DR_NETWORK", *networkFlag},
-		{"DR_EXEC", *execPolicyFlag},
-		{"DR_PROT_EXEC", *protExecFlag},
-		{"DR_FILE_WRITE", *fileWriteFlag},
-		{"DR_MAX_READ_BYTES", *maxReadBytesFlag},
-		{"DR_MAX_ALLOC_BYTES", *memFlag},
-	}
-	drProcLimit := *drMaxProcsFlag
-	if drProcLimit <= 0 {
-		drProcLimit = *procsFlag
-	}
-	if drProcLimit > 0 {
-		optionalEnv = append(optionalEnv, [2]string{"DR_MAX_PROCS", fmt.Sprintf("%d", drProcLimit)})
-	}
-	for _, item := range optionalEnv {
-		if item[1] != "" {
-			dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", item[0], item[1]))
+	if cfg.PolicyFile != "" {
+		policyEnv, err := loadPolicyFile(cfg.PolicyFile)
+		if err != nil {
+			return cfg, err
+		}
+		for k, v := range policyEnv {
+			cfg.Env[k] = v
 		}
 	}
+	for _, item := range evaluatorEnvValues {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || key == "" {
+			return cfg, fmt.Errorf("--env expects KEY=VALUE, got %q", item)
+		}
+		cfg.EvaluatorEnv[key] = value
+	}
+	for _, key := range passEnvValues {
+		if key == "" {
+			return cfg, errors.New("--pass-env expects a non-empty KEY")
+		}
+		cfg.EvaluatorEnv[key] = os.Getenv(key)
+	}
 
-	// Inner command: timeout + drrun + filter + -- program args
+	setIf := func(k, v string) {
+		if v != "" {
+			cfg.Env[k] = v
+		}
+	}
+	setIf("DR_PATH_POLICY", *pathPolicy)
+	if *networkPolicy != "" {
+		if isSimplePolicySwitch(*networkPolicy) {
+			cfg.Env["DR_NETWORK"] = *networkPolicy
+		} else {
+			cfg.Env["DR_NETWORK_POLICY"] = *networkPolicy
+		}
+	}
+	setIf("DR_EXEC", *execPolicy)
+	setIf("DR_PROT_EXEC", *protExecPolicy)
+	if *fileWritePolicy != "" {
+		if strings.ContainsAny(*fileWritePolicy, ":;") {
+			cfg.Env["DR_FD_WRITE_POLICY"] = *fileWritePolicy
+		} else {
+			cfg.Env["DR_FILE_WRITE"] = *fileWritePolicy
+		}
+	}
+	setIf("DR_MAX_READ_BYTES", *maxReadBytes)
+	setIf("DR_MAX_ALLOC_BYTES", cfg.Mem)
+	if *auditPath != "" {
+		cfg.Env["DR_AUDIT_PATH"] = *auditPath
+	}
+	if *semanticAudit {
+		cfg.Env["DR_SEMANTIC_AUDIT"] = "1"
+	}
+	procLimit := *drMaxProcs
+	if procLimit <= 0 {
+		procLimit = cfg.Procs
+	}
+	if procLimit > 0 {
+		cfg.Env["DR_MAX_PROCS"] = fmt.Sprintf("%d", procLimit)
+	}
+
+	remaining := fs.Args()
+	if len(remaining) > 0 {
+		cfg.Exec = remaining[0]
+		cfg.Args = append([]string(nil), remaining[1:]...)
+	} else if *legacyExec != "" {
+		cfg.Exec = *legacyExec
+		if *legacyArgs != "" {
+			cfg.Args = strings.Fields(*legacyArgs)
+		}
+	} else {
+		return cfg, errors.New("missing evaluator command; use dynamorio-sandbox [flags] -- <program> [args...]")
+	}
+
+	if cfg.SessionID == "" {
+		cfg.SessionID = fmt.Sprintf("%d-%s", os.Getpid(), randomHex(4))
+	}
+	if cfg.Workdir == "" {
+		wd, err := os.Getwd()
+		if err != nil {
+			return cfg, err
+		}
+		cfg.Workdir = wd
+	}
+	return cfg, nil
+}
+
+type multiFlag []string
+
+func (m *multiFlag) String() string { return strings.Join(*m, ",") }
+
+func (m *multiFlag) Set(value string) error {
+	*m = append(*m, value)
+	return nil
+}
+
+func isSimplePolicySwitch(value string) bool {
+	switch value {
+	case "allow", "block", "deny", "strict", "0", "1", "true", "false", "yes", "no", "on", "off":
+		return true
+	default:
+		return false
+	}
+}
+
+func loadPolicyFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	out := map[string]string{}
+	s := bufio.NewScanner(f)
+	lineNo := 0
+	for s.Scan() {
+		lineNo++
+		line := strings.TrimSpace(s.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("%s:%d: expected KEY=VALUE", path, lineNo)
+		}
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if key == "" || !strings.HasPrefix(key, "DR_") {
+			return nil, fmt.Errorf("%s:%d: policy keys must be non-empty DR_* names", path, lineNo)
+		}
+		out[key] = value
+	}
+	if err := s.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func buildDockerArgs(cfg sandboxConfig) []string {
+	dockerArgs := []string{
+		"run", "--rm", "-i",
+		"--security-opt", "seccomp=unconfined",
+		"--cap-drop", "ALL",
+		"-v", fmt.Sprintf("%s:%s", cfg.Workdir, cfg.Workdir),
+		"-w", cfg.Workdir,
+		"-e", fmt.Sprintf("DR_SESSION_ID=%s", cfg.SessionID),
+		"-e", fmt.Sprintf("DR_SANDBOX_MODE=%s", cfg.Mode),
+		"-e", fmt.Sprintf("DR_REDIRECT_TMP=%t", cfg.RedirectTmp),
+	}
+
+	keys := make([]string, 0, len(cfg.Env))
+	for k := range cfg.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		if cfg.Env[k] != "" {
+			dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", k, cfg.Env[k]))
+		}
+	}
+	evalKeys := make([]string, 0, len(cfg.EvaluatorEnv))
+	for k := range cfg.EvaluatorEnv {
+		evalKeys = append(evalKeys, k)
+	}
+	sort.Strings(evalKeys)
+	for _, k := range evalKeys {
+		dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", k, cfg.EvaluatorEnv[k]))
+	}
+
 	innerCmd := []string{
-		"timeout", fmt.Sprintf("%.0f", timeoutFlag.Seconds()),
+		"timeout", fmt.Sprintf("%.0f", cfg.Timeout.Seconds()),
 		drrunPath,
 		"-c", filterSOPath,
 		"--",
-		*execFlag,
+		cfg.Exec,
 	}
-	innerCmd = append(innerCmd, progArgs...)
-
-	dockerArgs = append(dockerArgs, *imageFlag)
+	innerCmd = append(innerCmd, cfg.Args...)
+	dockerArgs = append(dockerArgs, cfg.Image)
 	dockerArgs = append(dockerArgs, innerCmd...)
+	return dockerArgs
+}
 
-	if *dryRunFlag {
+func usage() {
+	fmt.Fprintf(os.Stderr, "usage: dynamorio-sandbox [flags] -- <program> [args...]\n")
+	fmt.Fprintf(os.Stderr, "       dynamorio-sandbox --exec <program> --args '<args>' [flags]  # legacy\n")
+}
+
+func main() {
+	cfg, err := parseCLI(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		usage()
+		os.Exit(2)
+	}
+
+	dockerArgs := buildDockerArgs(cfg)
+	if cfg.DryRun {
 		fmt.Printf("docker %s\n", strings.Join(dockerArgs, " "))
 		return
 	}
+	if cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] session=%s exec=%s timeout=%s\n",
+			cfg.SessionID, cfg.Exec, cfg.Timeout)
+	}
 
-	fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] session=%s exec=%s timeout=%s\n",
-		sessionID, *execFlag, *timeoutFlag)
-
-	// Create a context with timeout + signal cancellation
-	ctx, cancel := context.WithTimeout(context.Background(), *timeoutFlag+5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout+5*time.Second)
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
@@ -134,48 +314,37 @@ func main() {
 	go func() {
 		select {
 		case sig := <-sigCh:
-			fmt.Fprintf(os.Stderr, "\n[dynamorio-sandbox] caught %s – killing container\n", sig)
+			if cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "\n[dynamorio-sandbox] caught %s; killing carrier\n", sig)
+			}
 			cancel()
 		case <-ctx.Done():
 		}
 	}()
 
 	cmd := exec.CommandContext(ctx, "docker", dockerArgs...)
-
-	// Stream stdout/stderr
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = io.MultiWriter(os.Stderr, prefixWriter{prefix: "[sandbox] ", w: os.Stderr})
-
-	// Use the same process group so killpg works
+	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	start := time.Now()
-	err := cmd.Run()
+	err = cmd.Run()
 	elapsed := time.Since(start)
-
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] TIMEOUT after %s\n", elapsed.Round(time.Millisecond))
+			if cfg.Verbose {
+				fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] TIMEOUT after %s\n", elapsed.Round(time.Millisecond))
+			}
 			os.Exit(124)
 		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] carrier error: %v\n", err)
 		os.Exit(1)
 	}
-
-	fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] completed in %s\n", elapsed.Round(time.Millisecond))
-}
-
-// prefixWriter is intentionally a no-op here (stdout/stderr are already streamed).
-// We keep it for future per-line prefixing without allocation overhead.
-type prefixWriter struct {
-	prefix string
-	w      io.Writer
-}
-
-func (p prefixWriter) Write(b []byte) (int, error) {
-	// No-op duplicate: stdout/stderr already streamed above.
-	return len(b), nil
+	if cfg.Verbose {
+		fmt.Fprintf(os.Stderr, "[dynamorio-sandbox] completed in %s\n", elapsed.Round(time.Millisecond))
+	}
 }
