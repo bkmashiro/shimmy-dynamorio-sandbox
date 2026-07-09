@@ -24,7 +24,7 @@ MAX_PROCS      ?= 5
 DR_MODE        ?= observe
 DR_REDIRECT_TMP ?= 1
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config clean
 
 all: client test-prog
 
@@ -133,6 +133,21 @@ smoke-dynamic-shell: docker-build
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    bash -lc 'rm -rf /tmp/shimmy-dr-dynamic /tmp/dr-sandbox/dynamic-shell/tmp/shimmy-dr-dynamic; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /bin/bash -lc "mkdir -p /tmp/shimmy-dr-dynamic/cache && printf dynamic >/tmp/shimmy-dr-dynamic/cache/value.txt && test -f /tmp/shimmy-dr-dynamic/cache/value.txt && grep -q dynamic /tmp/shimmy-dr-dynamic/cache/value.txt && mv /tmp/shimmy-dr-dynamic/cache/value.txt /tmp/shimmy-dr-dynamic/cache/value2.txt && rm /tmp/shimmy-dr-dynamic/cache/value2.txt && rmdir /tmp/shimmy-dr-dynamic/cache && rmdir /tmp/shimmy-dr-dynamic" 2>/tmp/dynamic-audit.log; test ! -e /tmp/shimmy-dr-dynamic; grep -q "\"path\":\"/tmp/shimmy-dr-dynamic/cache/value.txt\"" /tmp/dynamic-audit.log; echo dynamic shell ok $$(grep -c "^{" /tmp/dynamic-audit.log)'
+
+# Configurable path policy smoke: first-match DR_PATH_POLICY rules can make
+# arbitrary roots read-only, shared read-write, private/remapped, or blocked.
+smoke-policy-config: docker-build
+	docker run --rm \
+	    -e DR_SESSION_ID=policy-config \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_REDIRECT_TMP=0 \
+	    -e DR_AUDIT_JSONL=1 \
+	    -e DR_AUDIT_PATH=/tmp/dr-policy-audit.jsonl \
+	    -e DR_HUMAN_LOG=0 \
+	    -e 'DR_PATH_POLICY=ro:/tmp/dr-ro;rw:/tmp/dr-rw;private:/tmp/dr-private;block:/tmp/dr-block' \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -euo pipefail -lc 'rm -rf /tmp/dr-ro /tmp/dr-rw /tmp/dr-private /tmp/dr-block /tmp/dr-sandbox/policy-config /tmp/dr-policy-audit.jsonl; mkdir -p /tmp/dr-ro /tmp/dr-rw /tmp/dr-private /tmp/dr-block; printf readable >/tmp/dr-ro/input.txt; printf secret >/tmp/dr-block/input.txt; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /bin/bash -lc "grep -q readable /tmp/dr-ro/input.txt && ! printf nope >/tmp/dr-ro/out.txt && printf shared >/tmp/dr-rw/out.txt && printf private >/tmp/dr-private/out.txt && ! cat /tmp/dr-block/input.txt >/dev/null"; grep -q shared /tmp/dr-rw/out.txt; test ! -e /tmp/dr-private/out.txt; grep -q private /tmp/dr-sandbox/policy-config/tmp/dr-private/out.txt; grep -q "\"action\":\"readonly\"" /tmp/dr-policy-audit.jsonl; grep -q "\"action\":\"block\"" /tmp/dr-policy-audit.jsonl; grep -q "\"action\":\"remap\"" /tmp/dr-policy-audit.jsonl; echo policy config ok $$(wc -l </tmp/dr-policy-audit.jsonl)'
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 

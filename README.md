@@ -16,6 +16,7 @@ This prototype now supports two runtime modes:
 | `DR_AUDIT_JSONL=1` | Emit machine-readable JSONL audit records for observed/remapped path/syscall events. |
 | `DR_AUDIT_PATH=/tmp/dr-audit.jsonl` | Write JSONL audit to a separate append-only file instead of stderr, avoiding corrupted/interleaved audit when Wolfram child processes also write stderr. |
 | `DR_HUMAN_LOG=0` | Disable human-readable `[dr-sandbox]` logs; useful when collecting clean audit files. |
+| `DR_PATH_POLICY='ro:/data/ref;rw:/tmp/shared;private:/tmp/work;block:/secrets'` | Optional first-match path policy. Actions: `ro`/`readonly` allows reads but blocks write-intent opens and mutating path ops; `rw`/`pass` leaves the path shared; `private` remaps into `/tmp/dr-sandbox/<session-id>/...`; `block` denies access. Rules are separated by `;` or `,`. |
 
 Use observe mode first, then derive a narrower enforce profile from logs. Do not start by blocking everything: Wolfram may legitimately write license/cache/paclet/temp files.
 
@@ -112,6 +113,9 @@ make smoke-audit-jsonl
 
 # Verify Wolfram-style rendezvous paths stay shared while normal /tmp stays private
 make smoke-wolfram-path-policy
+
+# Verify configurable path policies: read-only, read-write/shared, private/remapped, blocked
+make smoke-policy-config
 
 # Verify a real dynamic /bin/bash process can run through observe mode
 make smoke-dynamic-shell

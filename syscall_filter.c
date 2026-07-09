@@ -342,6 +342,19 @@ typedef enum {
     MODE_STRICT  = 1,  /* original deny-by-default sandbox policy */
 } sandbox_mode_t;
 
+typedef enum {
+    PATH_POLICY_DEFAULT = 0,
+    PATH_POLICY_PASS,
+    PATH_POLICY_READONLY,
+    PATH_POLICY_PRIVATE,
+    PATH_POLICY_BLOCK,
+} path_policy_action_t;
+
+typedef struct {
+    path_policy_action_t action;
+    char prefix[256];
+} path_policy_rule_t;
+
 /* ── global state ────────────────────────────────────────────── */
 static char           g_session_id[64];
 static char           g_sandbox_root[256];   /* /tmp/dr-sandbox/<session-id>/ */
@@ -351,6 +364,8 @@ static bool           g_audit_jsonl = false;
 static bool           g_human_log = true;
 static int            g_proc_count = 0;
 static void          *g_mutex;
+static path_policy_rule_t g_path_rules[32];
+static int            g_path_rule_count = 0;
 
 static file_t         g_log;                 /* human log handle, stderr by default */
 static file_t         g_audit_log;           /* JSONL audit handle, stderr unless DR_AUDIT_PATH is set */
@@ -508,6 +523,8 @@ static void canonicalize_path(const char *path, char *out, size_t outsz)
     }
 }
 
+static bool path_is_private_write_candidate(const char *path);
+
 /* ── path utility: check if path starts with a prefix at a component boundary ── */
 static bool path_has_prefix_component(const char *path, const char *prefix)
 {
@@ -516,6 +533,128 @@ static bool path_has_prefix_component(const char *path, const char *prefix)
         return false;
     char c = path[plen];
     return c == '\0' || c == '/';
+}
+
+static const char *path_policy_action_name(path_policy_action_t action)
+{
+    switch (action) {
+        case PATH_POLICY_PASS:     return "pass";
+        case PATH_POLICY_READONLY: return "readonly";
+        case PATH_POLICY_PRIVATE:  return "private";
+        case PATH_POLICY_BLOCK:    return "block";
+        default:                   return "default";
+    }
+}
+
+static bool parse_path_policy_action(const char *name, size_t len,
+                                     path_policy_action_t *out)
+{
+    if ((len == 2 && strncmp(name, "ro", len) == 0) ||
+        (len == 4 && strncmp(name, "read", len) == 0) ||
+        (len == 8 && strncmp(name, "readonly", len) == 0)) {
+        *out = PATH_POLICY_READONLY;
+        return true;
+    }
+    if ((len == 2 && strncmp(name, "rw", len) == 0) ||
+        (len == 4 && strncmp(name, "pass", len) == 0) ||
+        (len == 5 && strncmp(name, "allow", len) == 0)) {
+        *out = PATH_POLICY_PASS;
+        return true;
+    }
+    if ((len == 7 && strncmp(name, "private", len) == 0) ||
+        (len == 5 && strncmp(name, "remap", len) == 0)) {
+        *out = PATH_POLICY_PRIVATE;
+        return true;
+    }
+    if ((len == 5 && strncmp(name, "block", len) == 0) ||
+        (len == 4 && strncmp(name, "deny", len) == 0)) {
+        *out = PATH_POLICY_BLOCK;
+        return true;
+    }
+    return false;
+}
+
+static void parse_path_policy_rules(const char *spec)
+{
+    g_path_rule_count = 0;
+    if (!spec || !*spec)
+        return;
+
+    const char *p = spec;
+    while (*p && g_path_rule_count < (int)(sizeof(g_path_rules) / sizeof(g_path_rules[0]))) {
+        while (*p == ';' || *p == ',' || *p == ' ' || *p == '\t' || *p == '\n')
+            p++;
+        if (!*p)
+            break;
+
+        const char *action_start = p;
+        while (*p && *p != ':' && *p != '=')
+            p++;
+        if (!*p)
+            break;
+        const char *action_end = p++;
+
+        const char *path_start = p;
+        while (*p && *p != ';' && *p != ',')
+            p++;
+        const char *path_end = p;
+        while (path_end > path_start &&
+               (path_end[-1] == ' ' || path_end[-1] == '\t' || path_end[-1] == '\n'))
+            path_end--;
+
+        path_policy_action_t action;
+        if (parse_path_policy_action(action_start, (size_t)(action_end - action_start), &action) &&
+            path_end > path_start) {
+            char raw[256];
+            size_t len = (size_t)(path_end - path_start);
+            if (len >= sizeof(raw)) len = sizeof(raw) - 1;
+            memcpy(raw, path_start, len);
+            raw[len] = '\0';
+
+            path_policy_rule_t *rule = &g_path_rules[g_path_rule_count++];
+            rule->action = action;
+            if (raw[0] == '/')
+                canonicalize_path(raw, rule->prefix, sizeof(rule->prefix));
+            else {
+                size_t rlen = strlen(raw);
+                if (rlen >= sizeof(rule->prefix)) rlen = sizeof(rule->prefix) - 1;
+                memcpy(rule->prefix, raw, rlen);
+                rule->prefix[rlen] = '\0';
+            }
+        }
+    }
+}
+
+static path_policy_action_t configured_path_policy_for(const char *path)
+{
+    if (g_path_rule_count <= 0)
+        return PATH_POLICY_DEFAULT;
+
+    char canonical[512];
+    if (path[0] == '/')
+        canonicalize_path(path, canonical, sizeof(canonical));
+    else {
+        size_t plen = strlen(path);
+        if (plen >= sizeof(canonical)) plen = sizeof(canonical) - 1;
+        memcpy(canonical, path, plen);
+        canonical[plen] = '\0';
+    }
+
+    for (int i = 0; i < g_path_rule_count; i++) {
+        if (path_has_prefix_component(canonical, g_path_rules[i].prefix))
+            return g_path_rules[i].action;
+    }
+    return PATH_POLICY_DEFAULT;
+}
+
+static path_policy_action_t effective_path_policy_for(const char *path)
+{
+    path_policy_action_t configured = configured_path_policy_for(path);
+    if (configured != PATH_POLICY_DEFAULT)
+        return configured;
+    if (g_redirect_tmp && path_is_private_write_candidate(path))
+        return PATH_POLICY_PRIVATE;
+    return PATH_POLICY_PASS;
 }
 
 /* ── path utility: check if path starts with a blocked prefix ── */
@@ -600,8 +739,24 @@ static bool remap_private_path_param(void *drcontext, int sysnum, int param_inde
         return false;
     }
 
-    if (!g_redirect_tmp || !path_is_private_write_candidate(orig))
+    path_policy_action_t policy = effective_path_policy_for(orig);
+    if (policy == PATH_POLICY_BLOCK) {
+        LOG("BLOCK %s syscall=%d param=%d: %s", label, sysnum, param_index, orig);
+        audit_path_event("block", sysnum, label, orig, NULL);
+        set_errno_result(drcontext, EPERM);
+        return false;
+    }
+    if (policy == PATH_POLICY_READONLY && ensure_parent) {
+        LOG("READONLY %s syscall=%d param=%d: %s", label, sysnum, param_index, orig);
+        audit_path_event("readonly", sysnum, label, orig, NULL);
+        set_errno_result(drcontext, EPERM);
+        return false;
+    }
+    if (policy != PATH_POLICY_PRIVATE) {
+        if (g_mode == MODE_OBSERVE)
+            audit_path_event(path_policy_action_name(policy), sysnum, label, orig, NULL);
         return true;
+    }
 
     char remapped[512];
     if (!remap_path(orig, remapped, sizeof(remapped))) {
@@ -826,7 +981,22 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             return false;
         }
 
-        if (g_mode == MODE_STRICT && path_is_blocked(orig)) {
+        path_policy_action_t policy = effective_path_policy_for(orig);
+        bool has_configured_policy = configured_path_policy_for(orig) != PATH_POLICY_DEFAULT;
+        if (policy == PATH_POLICY_BLOCK) {
+            LOG("BLOCK open: %s", orig);
+            audit_path_event("block", sysnum, "open", orig, NULL);
+            set_errno_result(drcontext, EPERM);
+            return false;
+        }
+        if (policy == PATH_POLICY_READONLY && open_flags_write_intent(flags)) {
+            LOG("READONLY open: %s flags=0x%x", orig, flags);
+            audit_path_event("readonly", sysnum, "open", orig, NULL);
+            set_errno_result(drcontext, EPERM);
+            return false;
+        }
+
+        if (!has_configured_policy && g_mode == MODE_STRICT && path_is_blocked(orig)) {
             LOG("BLOCK open: %s", orig);
             if (strncmp(orig, "/etc/shadow", 11) == 0 &&
                     (orig[11] == '\0' || orig[11] == '/'))
@@ -836,11 +1006,11 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             return false;
         }
 
-        bool should_redirect = g_redirect_tmp && path_is_private_write_candidate(orig);
+        bool should_redirect = policy == PATH_POLICY_PRIVATE;
         if (!should_redirect) {
             if (g_mode == MODE_OBSERVE) {
-                LOG("OBSERVE open: %s flags=0x%x", orig, flags);
-                audit_path_event("observe", sysnum, "open", orig, NULL);
+                LOG("%s open: %s flags=0x%x", path_policy_action_name(policy), orig, flags);
+                audit_path_event(path_policy_action_name(policy), sysnum, "open", orig, NULL);
             }
             return true;
         }
@@ -1092,10 +1262,6 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
          strcmp(env_human_log, "no") == 0))
         g_human_log = false;
 
-    ensure_private_dirs();
-
-    g_mutex = dr_mutex_create();
-
     const char *env_audit_path = getenv("DR_AUDIT_PATH");
     if (env_audit_path && *env_audit_path) {
         file_t audit_file = dr_open_file(env_audit_path,
@@ -1108,10 +1274,18 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
         }
     }
 
+    const char *env_path_policy = getenv("DR_PATH_POLICY");
+    parse_path_policy_rules(env_path_policy);
+
+    ensure_private_dirs();
+
+    g_mutex = dr_mutex_create();
+
     dr_register_filter_syscall_event(event_filter_syscall);
     dr_register_pre_syscall_event(event_pre_syscall);
 
-    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s audit_jsonl=%s",
+    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s audit_jsonl=%s path_rules=%d",
         g_sandbox_root, g_mode == MODE_STRICT ? "strict" : "observe",
-        g_redirect_tmp ? "true" : "false", g_audit_jsonl ? "true" : "false");
+        g_redirect_tmp ? "true" : "false", g_audit_jsonl ? "true" : "false",
+        g_path_rule_count);
 }
