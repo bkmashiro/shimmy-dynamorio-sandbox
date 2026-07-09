@@ -24,6 +24,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 const (
@@ -37,6 +38,7 @@ type sandboxConfig struct {
 	Exec         string
 	Args         []string
 	Timeout      time.Duration
+	KillAfter    time.Duration
 	Mem          string
 	Procs        int
 	Image        string
@@ -60,6 +62,7 @@ func randomHex(n int) string {
 func parseCLI(args []string) (sandboxConfig, error) {
 	cfg := sandboxConfig{
 		Timeout:      30 * time.Second,
+		KillAfter:    5 * time.Second,
 		Image:        defaultImage,
 		Mode:         "observe",
 		RedirectTmp:  true,
@@ -72,6 +75,7 @@ func parseCLI(args []string) (sandboxConfig, error) {
 	legacyExec := fs.String("exec", "", "Program to execute inside the sandbox")
 	legacyArgs := fs.String("args", "", "Space-separated arguments for the program")
 	fs.DurationVar(&cfg.Timeout, "timeout", cfg.Timeout, "Maximum execution time (e.g. 30s, 2m)")
+	fs.DurationVar(&cfg.KillAfter, "timeout-kill-after", cfg.KillAfter, "Grace period after timeout before force-killing evaluator subprocesses")
 	fs.StringVar(&cfg.Mem, "max-mem", "", "DR allocation budget via DR_MAX_ALLOC_BYTES (e.g. 128m, 1g); empty = unlimited")
 	fs.IntVar(&cfg.Procs, "max-procs", 0, "DR process limit via DR_MAX_PROCS; 0 = client default")
 	fs.StringVar(&cfg.Image, "image", cfg.Image, "Docker image to use")
@@ -178,6 +182,9 @@ func parseCLI(args []string) (sandboxConfig, error) {
 	if cfg.SessionID == "" {
 		cfg.SessionID = fmt.Sprintf("%d-%s", os.Getpid(), randomHex(4))
 	}
+	if cfg.KillAfter <= 0 {
+		return cfg, errors.New("--timeout-kill-after must be positive")
+	}
 	if cfg.Workdir == "" {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -239,9 +246,42 @@ func loadPolicyFile(path string) (map[string]string, error) {
 	return out, nil
 }
 
+func containerName(sessionID string) string {
+	var b strings.Builder
+	b.WriteString("dr-sandbox-")
+	lastDash := false
+	for _, r := range sessionID {
+		valid := unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '.'
+		if valid {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	name := strings.Trim(b.String(), "-.")
+	if name == "" || name == "dr-sandbox" {
+		return "dr-sandbox-session"
+	}
+	return name
+}
+
+func durationSecondsString(d time.Duration) string {
+	seconds := d.Seconds()
+	if seconds == float64(int64(seconds)) {
+		return fmt.Sprintf("%.0fs", seconds)
+	}
+	value := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.3f", seconds), "0"), ".")
+	return value + "s"
+}
+
 func buildDockerArgs(cfg sandboxConfig) []string {
 	dockerArgs := []string{
-		"run", "--rm", "-i",
+		"run", "--rm", "-i", "--init",
+		"--name", containerName(cfg.SessionID),
 		"--security-opt", "seccomp=unconfined",
 		"--cap-drop", "ALL",
 		"-v", fmt.Sprintf("%s:%s", cfg.Workdir, cfg.Workdir),
@@ -271,7 +311,7 @@ func buildDockerArgs(cfg sandboxConfig) []string {
 	}
 
 	innerCmd := []string{
-		"timeout", fmt.Sprintf("%.0f", cfg.Timeout.Seconds()),
+		"timeout", fmt.Sprintf("--kill-after=%s", durationSecondsString(cfg.KillAfter)), durationSecondsString(cfg.Timeout),
 		drrunPath,
 		"-c", filterSOPath,
 		"--",
@@ -306,7 +346,7 @@ func main() {
 			cfg.SessionID, cfg.Exec, cfg.Timeout)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout+5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout+cfg.KillAfter+5*time.Second)
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)

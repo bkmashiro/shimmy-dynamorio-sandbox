@@ -70,6 +70,7 @@ func TestBuildDockerArgsUsesExactCommandAndPolicyEnv(t *testing.T) {
 		Exec:        "/bin/sh",
 		Args:        []string{"-c", "printf hi"},
 		Timeout:     2 * time.Second,
+		KillAfter:   750 * time.Millisecond,
 		Image:       "dynamorio-sandbox",
 		SessionID:   "test-session",
 		Mode:        "observe",
@@ -87,8 +88,14 @@ func TestBuildDockerArgsUsesExactCommandAndPolicyEnv(t *testing.T) {
 	if indexOf(args, "-i") < 0 {
 		t.Fatalf("docker args must include -i so evaluator stdin is transparent: %#v", args)
 	}
+	if indexOf(args, "--init") < 0 {
+		t.Fatalf("docker args must include --init so evaluator subprocesses are reaped: %#v", args)
+	}
+	if got := valueAfter(args, "--name"); got != "dr-sandbox-test-session" {
+		t.Fatalf("container name = %q, want dr-sandbox-test-session; args=%#v", got, args)
+	}
 	joined := strings.Join(args, "\x00")
-	for _, want := range []string{"DR_AUDIT_PATH=/tmp/audit.jsonl", "DR_NETWORK_POLICY=block:*", "EVALUATOR_MARK=ok", "/workspace/evaluator:/workspace/evaluator", drrunPath, filterSOPath, "/bin/sh", "printf hi"} {
+	for _, want := range []string{"DR_AUDIT_PATH=/tmp/audit.jsonl", "DR_NETWORK_POLICY=block:*", "EVALUATOR_MARK=ok", "/workspace/evaluator:/workspace/evaluator", "--kill-after=0.75s", drrunPath, filterSOPath, "/bin/sh", "printf hi"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("docker args missing %q: %#v", want, args)
 		}
@@ -101,6 +108,14 @@ func TestBuildDockerArgsUsesExactCommandAndPolicyEnv(t *testing.T) {
 	}
 }
 
+func TestContainerNameSanitizesSessionID(t *testing.T) {
+	got := containerName("job/Case #42__with spaces")
+	want := "dr-sandbox-job-Case-42-with-spaces"
+	if got != want {
+		t.Fatalf("containerName = %q, want %q", got, want)
+	}
+}
+
 func indexOf(items []string, target string) int {
 	for i, item := range items {
 		if item == target {
@@ -108,4 +123,12 @@ func indexOf(items []string, target string) int {
 		}
 	}
 	return -1
+}
+
+func valueAfter(items []string, target string) string {
+	idx := indexOf(items, target)
+	if idx < 0 || idx+1 >= len(items) {
+		return ""
+	}
+	return items[idx+1]
 }

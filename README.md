@@ -167,6 +167,7 @@ go run ./cmd/dynamorio-sandbox --exec /bin/ls --args "/tmp" --timeout 10s
     dynamorio-sandbox --exec <program> --args '<args>' [flags]
 
   --timeout   duration  Max execution time (default 30s)
+  --timeout-kill-after duration  Grace period before force-killing timed-out evaluator tree (default 5s)
   --policy-file string  Env-style DR policy file
   --env KEY=VALUE       Evaluator environment variable; repeatable
   --pass-env KEY        Pass one host environment variable into the carrier; repeatable

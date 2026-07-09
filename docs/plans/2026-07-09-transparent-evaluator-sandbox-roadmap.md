@@ -37,7 +37,7 @@ Known constraints:
 
 - Local Apple Silicon Docker amd64 emulation can crash DynamoRIO with `SIGBUS`; do not use it as a runtime correctness gate.
 - Current Go wrapper is still Docker-shaped; transparent auto-attach for arbitrary evaluator launchers is not yet first-class.
-- Current timeout is external `timeout`/Go context; DR-side/resource-side timeout and process-tree cleanup need hardening.
+- Current timeout is external GNU `timeout` inside the Docker carrier plus a Go carrier watchdog; DR-side/resource-side timeout metrics still need hardening.
 
 ## Integration model
 
@@ -169,6 +169,8 @@ Required transparency rules:
 
 ### 2.1 Wall timeout and process-tree cleanup
 
+**Status:** Lightweight launcher slice implemented. Docker-carrier runs now include `--init`, a deterministic container name derived from `DR_SESSION_ID`, GNU `timeout --kill-after=<duration> <timeout>`, and an outer Go watchdog sized to timeout + kill-after + slack. This is dry-run/unit-test covered and avoids pulling or rebuilding large images on local macOS.
+
 **Files:**
 - Modify: `cmd/dynamorio-sandbox/main.go`
 - Modify: `Makefile`
@@ -182,6 +184,13 @@ Required transparency rules:
 4. Define timeout exit code, probably `124`, matching GNU `timeout`.
 5. Write timeout reason to metrics/audit side-channel.
 6. CodeBuild gate must prove no leaked process after timeout.
+
+**Implemented lightweight local slice:**
+
+- `--timeout-kill-after` flag, default `5s`.
+- Docker `--init` so child processes are reaped inside the carrier.
+- Stable sanitized container name, enabling future cleanup/probe hooks by session ID.
+- Dry-run/build-args tests for exact timeout and container options.
 
 **Done when:** timeout reliably kills the whole evaluator tree and reports a deterministic exit code.
 
