@@ -46,6 +46,8 @@
 #define SYS_sched_yield 24
 #define SYS_mremap      25
 #define SYS_msync       26
+#define SYS_dup         32
+#define SYS_dup2        33
 #define SYS_socket      41
 #define SYS_connect     42
 #define SYS_accept      43
@@ -387,6 +389,13 @@ static bool           g_block_network = false;
 static bool           g_block_exec = false;
 static bool           g_block_prot_exec = false;
 static bool           g_stdio_only_writes = false;
+static size_t         g_max_stdout_bytes = 0; /* 0 = unlimited */
+static size_t         g_max_stderr_bytes = 0; /* 0 = unlimited */
+static size_t         g_stdout_bytes = 0;
+static size_t         g_stderr_bytes = 0;
+static bool           g_output_truncate = false;
+static uint64         g_start_ms = 0;
+static uint64         g_max_cpu_ms = 0; /* syscall-active wall/CPU-ish budget; 0 = unlimited */
 static int            g_proc_count = 0;
 static void          *g_mutex;
 static path_policy_rule_t g_path_rules[32];
@@ -404,6 +413,10 @@ static size_t         g_last_mmap_len;
 static size_t         g_last_mremap_old_len;
 static size_t         g_last_mremap_new_len;
 static size_t         g_last_munmap_len;
+static bool           g_pending_dup;
+static int            g_pending_dup_src;
+static int            g_pending_dup_dst;
+static bool           g_pending_dup_has_dst;
 
 static file_t         g_log;                 /* human log handle, stderr by default */
 static file_t         g_audit_log;           /* JSONL audit handle, stderr unless DR_AUDIT_PATH is set */
@@ -492,6 +505,27 @@ static void audit_syscall_event(const char *action, int sysnum)
     audit_write_line(line);
 }
 
+static void audit_resource_event(const char *name, const char *action, int sysnum,
+                                 unsigned long long used, unsigned long long limit)
+{
+    if (!g_audit_jsonl)
+        return;
+    char line[768];
+    char *p = line;
+    char *end = line + sizeof(line) - 2;
+    audit_append_raw(&p, end, "{\"type\":\"resource\",\"session\":");
+    audit_append_json_string(&p, end, g_session_id);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"mode\":\"%s\",\"name\":",
+                     g_mode == MODE_STRICT ? "strict" : "observe");
+    audit_append_json_string(&p, end, name);
+    audit_append_raw(&p, end, ",\"action\":");
+    audit_append_json_string(&p, end, action);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"syscall\":%d,\"used\":%llu,\"limit\":%llu}\n",
+                     sysnum, used, limit);
+    *p = '\0';
+    audit_write_line(line);
+}
+
 static void audit_semantic_event(const char *name, const char *action, int sysnum,
                                  long fd, const char *path, const char *peer)
 {
@@ -570,6 +604,17 @@ static int parse_int_env(const char *value, int fallback)
     if (endp == value || n < 1 || n > 100000)
         return fallback;
     return (int)n;
+}
+
+static uint64 parse_uint64_env(const char *value, uint64 fallback)
+{
+    if (!value || !*value)
+        return fallback;
+    char *endp = NULL;
+    unsigned long long n = strtoull(value, &endp, 10);
+    if (endp == value)
+        return fallback;
+    return (uint64)n;
 }
 
 static bool alloc_budget_enabled(void)
@@ -1191,6 +1236,105 @@ static fd_shadow_t *fd_shadow_get(int fd)
     return &g_fd_shadow[fd];
 }
 
+static bool proc_self_fd_target(const char *path, int *fd_out)
+{
+    const char *prefix = "/proc/self/fd/";
+    size_t plen = strlen(prefix);
+    if (strncmp(path, prefix, plen) != 0)
+        return false;
+    char *endp = NULL;
+    long fd = strtol(path + plen, &endp, 10);
+    if (endp == path + plen || *endp != '\0' || fd < 0 || fd > 100000)
+        return false;
+    *fd_out = (int)fd;
+    return true;
+}
+
+static void fd_shadow_copy(int dst, int src)
+{
+    fd_shadow_t *shadow = fd_shadow_get(src);
+    if (!shadow) {
+        fd_shadow_clear(dst);
+        return;
+    }
+    fd_shadow_set(dst, shadow->path, shadow->block_write);
+    audit_semantic_event("fd", shadow->block_write ? "dup-track-block-write" : "dup-track",
+                         g_last_sysnum, dst, shadow->path, NULL);
+}
+
+static bool network_policy_blocks_unknown_peer(void)
+{
+    return network_policy_blocks_peer("*", -1, g_block_network);
+}
+
+static bool check_cpuish_budget(void *drcontext, int sysnum)
+{
+    if (g_max_cpu_ms == 0 || g_start_ms == 0)
+        return true;
+    if (!(sysnum == SYS_read || sysnum == SYS_pread64 || sysnum == SYS_write ||
+          sysnum == SYS_pwrite64 || sysnum == SYS_open || sysnum == SYS_openat ||
+          sysnum == SYS_creat))
+        return true;
+    uint64 elapsed = dr_get_milliseconds() - g_start_ms;
+    if (elapsed <= g_max_cpu_ms)
+        return true;
+    LOG("BLOCK cpu-ish timeout: elapsed=%llu max=%llu", (unsigned long long)elapsed,
+        (unsigned long long)g_max_cpu_ms);
+    audit_resource_event("cpu-timeout", "block", sysnum,
+                         (unsigned long long)elapsed, (unsigned long long)g_max_cpu_ms);
+    set_errno_result(drcontext, ETIMEDOUT);
+    return false;
+}
+
+static bool enforce_output_limit(void *drcontext, int sysnum, int fd, size_t requested)
+{
+    size_t *used = NULL;
+    size_t limit = 0;
+    const char *name = NULL;
+    if (fd == 1 && g_max_stdout_bytes > 0) {
+        used = &g_stdout_bytes;
+        limit = g_max_stdout_bytes;
+        name = "stdout-limit";
+    } else if (fd == 2 && g_max_stderr_bytes > 0) {
+        used = &g_stderr_bytes;
+        limit = g_max_stderr_bytes;
+        name = "stderr-limit";
+    } else {
+        return true;
+    }
+
+    if (*used >= limit) {
+        audit_resource_event(name, g_output_truncate ? "truncate" : "block", sysnum,
+                             (unsigned long long)*used, (unsigned long long)limit);
+        if (g_output_truncate) {
+            dr_syscall_result_info_t info;
+            memset(&info, 0, sizeof(info));
+            info.size = sizeof(info);
+            info.succeeded = true;
+            info.value = 0;
+            dr_syscall_set_result_ex(drcontext, &info);
+        } else {
+            set_errno_result(drcontext, EFBIG);
+        }
+        return false;
+    }
+
+    size_t remaining = limit - *used;
+    if (requested > remaining) {
+        audit_resource_event(name, g_output_truncate ? "truncate" : "block", sysnum,
+                             (unsigned long long)(*used + requested), (unsigned long long)limit);
+        if (!g_output_truncate) {
+            set_errno_result(drcontext, EFBIG);
+            return false;
+        }
+        if (sysnum == SYS_write || sysnum == SYS_pwrite64)
+            dr_syscall_set_param(drcontext, 2, (reg_t)remaining);
+        requested = remaining;
+    }
+    *used += requested;
+    return true;
+}
+
 /* ══════════════════════════════════════════════════════════════
  *  PRE-SYSCALL EVENT
  * ══════════════════════════════════════════════════════════════ */
@@ -1214,11 +1358,36 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
     g_last_mremap_new_len = 0;
     g_last_munmap_len = 0;
     g_pending_open = false;
+    g_pending_dup = false;
+
+    if (!check_cpuish_budget(drcontext, sysnum))
+        return false;
 
     if (sysnum == SYS_close) {
         int fd = (int)dr_syscall_get_param(drcontext, 0);
         audit_semantic_event("close", "allow", sysnum, fd, fd_shadow_get(fd) ? fd_shadow_get(fd)->path : NULL, NULL);
         fd_shadow_clear(fd);
+        return true;
+    }
+
+    if (sysnum == SYS_dup || sysnum == SYS_dup2 || sysnum == SYS_dup3) {
+        g_pending_dup = true;
+        g_pending_dup_src = (int)dr_syscall_get_param(drcontext, 0);
+        g_pending_dup_has_dst = sysnum == SYS_dup2 || sysnum == SYS_dup3;
+        g_pending_dup_dst = g_pending_dup_has_dst ? (int)dr_syscall_get_param(drcontext, 1) : -1;
+        if (g_pending_dup_has_dst)
+            fd_shadow_clear(g_pending_dup_dst);
+        return true;
+    }
+
+    if (sysnum == SYS_fcntl) {
+        int cmd = (int)dr_syscall_get_param(drcontext, 1);
+        if (cmd == 0 || cmd == 1030 /* F_DUPFD_CLOEXEC */) {
+            g_pending_dup = true;
+            g_pending_dup_src = (int)dr_syscall_get_param(drcontext, 0);
+            g_pending_dup_has_dst = false;
+            g_pending_dup_dst = -1;
+        }
         return true;
     }
 
@@ -1343,10 +1512,14 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         }
 
         g_pending_open = true;
-        g_pending_open_block_write = fd_write_policy_for(orig) == PATH_POLICY_BLOCK;
-        size_t open_path_len = strlen(orig);
+        int proc_fd = -1;
+        fd_shadow_t *proc_shadow = NULL;
+        if (proc_self_fd_target(orig, &proc_fd))
+            proc_shadow = fd_shadow_get(proc_fd);
+        g_pending_open_block_write = proc_shadow ? proc_shadow->block_write : fd_write_policy_for(orig) == PATH_POLICY_BLOCK;
+        size_t open_path_len = strlen(proc_shadow ? proc_shadow->path : orig);
         if (open_path_len >= sizeof(g_pending_open_path)) open_path_len = sizeof(g_pending_open_path) - 1;
-        memcpy(g_pending_open_path, orig, open_path_len);
+        memcpy(g_pending_open_path, proc_shadow ? proc_shadow->path : orig, open_path_len);
         g_pending_open_path[open_path_len] = '\0';
         audit_semantic_event("open", "allow", sysnum, -1, orig, NULL);
 
@@ -1437,6 +1610,10 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
     /* --- configurable non-path controls ----------------------- */
     if (sysnum == SYS_write || sysnum == SYS_writev || sysnum == SYS_pwrite64) {
         reg_t fd = dr_syscall_get_param(drcontext, 0);
+        if ((sysnum == SYS_write || sysnum == SYS_pwrite64) &&
+            !enforce_output_limit(drcontext, sysnum, (int)fd,
+                                  (size_t)dr_syscall_get_param(drcontext, 2)))
+            return false;
         fd_shadow_t *shadow = fd_shadow_get((int)fd);
         if (shadow && shadow->block_write) {
             LOG("BLOCK fd write: fd=%ld path=%s", (long)fd, shadow->path);
@@ -1560,7 +1737,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
                 have_peer = read_ipv4_peer(drcontext, dr_syscall_get_param(drcontext, 4), peer, sizeof(peer), ip, sizeof(ip), &port);
             else
                 have_peer = read_ipv4_peer(drcontext, dr_syscall_get_param(drcontext, 1), peer, sizeof(peer), ip, sizeof(ip), &port);
-            bool block = have_peer ? network_policy_blocks_peer(ip, port, g_block_network) : g_block_network;
+            bool block = have_peer ? network_policy_blocks_peer(ip, port, g_block_network) : network_policy_blocks_unknown_peer();
             if (block) {
                 LOG("BLOCK network syscall %d peer=%s", sysnum, have_peer ? peer : "unknown");
                 audit_semantic_event(sysnum == SYS_connect ? "connect" : (sysnum == SYS_bind ? "bind" : "sendto"),
@@ -1586,7 +1763,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         case SYS_getpeername:
         case SYS_setsockopt:
         case SYS_getsockopt:
-            if (g_block_network && g_network_rule_count <= 0) {
+            if (network_policy_blocks_unknown_peer()) {
                 LOG("BLOCK network syscall %d", sysnum);
                 audit_syscall_event("block", sysnum);
                 set_errno_result(drcontext, ENETDOWN);
@@ -1779,6 +1956,12 @@ static void event_post_syscall(void *drcontext, int sysnum)
         return;
     }
 
+    if (g_pending_dup && info.succeeded) {
+        int dst = g_pending_dup_has_dst ? g_pending_dup_dst : (int)result;
+        fd_shadow_copy(dst, g_pending_dup_src);
+        return;
+    }
+
     if (sysnum == SYS_mmap) {
         if (g_last_sysnum == SYS_mmap && g_last_mmap_len > 0 && info.succeeded)
             alloc_budget_add(g_last_mmap_len);
@@ -1857,6 +2040,12 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
     g_stdio_only_writes = g_mode == MODE_STRICT;
     g_max_read_bytes = parse_size_env(getenv("DR_MAX_READ_BYTES"), MAX_READ_BYTES);
     g_max_alloc_bytes = parse_size_env(getenv("DR_MAX_ALLOC_BYTES"), 0);
+    g_max_stdout_bytes = parse_size_env(getenv("DR_MAX_STDOUT_BYTES"), 0);
+    g_max_stderr_bytes = parse_size_env(getenv("DR_MAX_STDERR_BYTES"), 0);
+    const char *env_output_action = getenv("DR_OUTPUT_LIMIT_ACTION");
+    g_output_truncate = env_output_action && strcmp(env_output_action, "truncate") == 0;
+    g_max_cpu_ms = parse_uint64_env(getenv("DR_MAX_CPU_MS"), 0);
+    g_start_ms = dr_get_milliseconds();
     g_max_procs = parse_int_env(getenv("DR_MAX_PROCS"), MAX_PROCS);
     g_block_network = env_policy_blocks(getenv("DR_NETWORK"), g_block_network);
     g_block_exec = env_policy_blocks(getenv("DR_EXEC"), g_block_exec);

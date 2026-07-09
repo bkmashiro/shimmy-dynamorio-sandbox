@@ -190,6 +190,30 @@ go run ./cmd/dynamorio-sandbox --exec /bin/ls --args "/tmp" --timeout 10s
   --dry-run             Print docker command, don't run
 ```
 
+### One-env shim
+
+Existing evaluator launchers can opt into the wrapper without changing the evaluator command shape:
+
+```bash
+EVALUATOR_SANDBOX=dr \
+EVALUATOR_SANDBOX_CONFIG=/path/to/policy.env \
+EVALUATOR_SANDBOX_TIMEOUT=10s \
+scripts/dr-evaluator-launch -- evaluator arg1 arg2
+```
+
+Unset `EVALUATOR_SANDBOX` (or set `off`) to exec the evaluator unchanged. `EVALUATOR_SANDBOX_CONFIG` is an env-style `DR_*` policy file.
+
+Useful DR policy envs for evaluator-style limits:
+
+```bash
+DR_MAX_CPU_MS=1000
+DR_MAX_STDOUT_BYTES=1048576
+DR_MAX_STDERR_BYTES=1048576
+DR_OUTPUT_LIMIT_ACTION=fail   # or truncate
+DR_SEMANTIC_AUDIT=1
+DR_AUDIT_PATH=/tmp/dr-audit.jsonl
+```
+
 ## Comparison with seccomp-bpf
 
 | Feature | seccomp-bpf | DynamoRIO |

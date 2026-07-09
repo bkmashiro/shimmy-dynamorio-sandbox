@@ -28,10 +28,13 @@ Already available:
 - DR-only network/exec/PROT_EXEC/file-write policy switches.
 - DR allocation budget for `mmap`/`mremap`/`brk` growth.
 - DR process-count guard for `fork`/new-process `clone`.
-- FD shadow table for path-derived write blocking.
-- IPv4 network allow/block policy for `connect`/`bind`/`sendto`.
-- Semantic JSONL audit events for open/fd/write/socket/connect-style operations.
-- CodeBuild native x86_64 smoke as authoritative runtime gate.
+- DR syscall-active CPU-ish watchdog (`DR_MAX_CPU_MS`).
+- DR stdout/stderr output caps (`DR_MAX_STDOUT_BYTES`, `DR_MAX_STDERR_BYTES`, `DR_OUTPUT_LIMIT_ACTION`).
+- FD shadow table for path-derived write blocking, including dup/fcntl/proc-fd propagation.
+- IPv4 network allow/block policy for `connect`/`bind`/`sendto`, plus block-all coverage for unknown-family/IPv6 and UDP bypass cases.
+- Semantic/resource JSONL audit events for open/fd/write/socket/connect-style operations and resource-limit blocks.
+- One-env transparent shim (`scripts/dr-evaluator-launch`) for `EVALUATOR_SANDBOX=dr`.
+- CodeBuild/GitHub Actions native x86_64 smoke as authoritative runtime gate.
 
 Known constraints:
 

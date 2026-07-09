@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Transparent evaluator launch shim.
+#
+# Usage:
+#   EVALUATOR_SANDBOX=dr EVALUATOR_SANDBOX_CONFIG=policy.env \
+#     scripts/dr-evaluator-launch -- evaluator args...
+#
+# If EVALUATOR_SANDBOX is not "dr"/"dynamorio", this script execs the command
+# unchanged. That lets existing evaluator runners opt in with one env/config
+# value while preserving argv/stdin/stdout/stderr/exit-code semantics.
+
+if [[ "${1:-}" == "--" ]]; then
+  shift
+fi
+
+if [[ $# -eq 0 ]]; then
+  echo "usage: dr-evaluator-launch -- <program> [args...]" >&2
+  exit 2
+fi
+
+case "${EVALUATOR_SANDBOX:-}" in
+  dr|dynamorio)
+    wrapper="${DYNAMORIO_SANDBOX_WRAPPER:-dynamorio-sandbox}"
+    args=()
+    if [[ -n "${EVALUATOR_SANDBOX_CONFIG:-}" ]]; then
+      args+=(--policy-file "${EVALUATOR_SANDBOX_CONFIG}")
+    fi
+    if [[ -n "${EVALUATOR_SANDBOX_TIMEOUT:-}" ]]; then
+      args+=(--timeout "${EVALUATOR_SANDBOX_TIMEOUT}")
+    fi
+    if [[ -n "${EVALUATOR_SANDBOX_WORKDIR:-}" ]]; then
+      args+=(--workdir "${EVALUATOR_SANDBOX_WORKDIR}")
+    fi
+    exec "$wrapper" "${args[@]}" -- "$@"
+    ;;
+  ""|none|off|0|false)
+    exec "$@"
+    ;;
+  *)
+    echo "unsupported EVALUATOR_SANDBOX=${EVALUATOR_SANDBOX}; expected dr or unset" >&2
+    exit 2
+    ;;
+esac

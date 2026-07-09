@@ -33,7 +33,7 @@ DR_MAX_READ_BYTES ?=
 DR_MAX_ALLOC_BYTES ?=
 DR_MAX_PROCS   ?=
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env smoke-transparent-timeout clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env smoke-transparent-timeout smoke-transparent-shim clean
 
 all: client test-prog
 
@@ -227,6 +227,68 @@ smoke-runtime-config: docker-build
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    bash -euo pipefail -lc 'rm -f /tmp/dr-semantic-audit.jsonl /tmp/dr-fd-shadow-policy.txt; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls fd_write_policy; grep -q "\"type\":\"semantic\"" /tmp/dr-semantic-audit.jsonl; grep -q "\"name\":\"open\"" /tmp/dr-semantic-audit.jsonl; grep -q "\"name\":\"write\"" /tmp/dr-semantic-audit.jsonl; grep -q "\"action\":\"block\"" /tmp/dr-semantic-audit.jsonl; echo semantic audit ok $$(wc -l </tmp/dr-semantic-audit.jsonl)'
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-stdout-limit \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_MAX_STDOUT_BYTES=4 \
+	    -e DR_OUTPUT_LIMIT_ACTION=fail \
+	    -e DR_SEMANTIC_AUDIT=1 \
+	    -e DR_AUDIT_PATH=/tmp/dr-resource-audit.jsonl \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -euo pipefail -lc 'rm -f /tmp/dr-resource-audit.jsonl; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls stdout_limit; grep -q "\"type\":\"resource\"" /tmp/dr-resource-audit.jsonl; grep -q "\"name\":\"stdout-limit\"" /tmp/dr-resource-audit.jsonl; grep -q "\"action\":\"block\"" /tmp/dr-resource-audit.jsonl; echo stdout limit ok'
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-stderr-limit \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_MAX_STDERR_BYTES=4 \
+	    -e DR_OUTPUT_LIMIT_ACTION=fail \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls stderr_limit
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-cpu-timeout \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_MAX_CPU_MS=20 \
+	    -e DR_SEMANTIC_AUDIT=1 \
+	    -e DR_AUDIT_PATH=/tmp/dr-cpu-audit.jsonl \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -euo pipefail -lc 'rm -f /tmp/dr-cpu-audit.jsonl; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls cpu_timeout; grep -q "\"name\":\"cpu-timeout\"" /tmp/dr-cpu-audit.jsonl; echo cpu timeout audit ok'
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-fd-dup \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_FD_WRITE_POLICY=block:/tmp/dr-fd-shadow-policy.txt \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls fd_dup_write_policy
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-proc-fd \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_FD_WRITE_POLICY=block:/tmp/dr-fd-shadow-policy.txt \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls proc_fd_write_policy
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-netpolicy-ipv6 \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e 'DR_NETWORK_POLICY=block:*' \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls network_ipv6_policy
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-netpolicy-udp \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e 'DR_NETWORK_POLICY=block:*' \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls network_udp_policy
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 
@@ -244,6 +306,9 @@ smoke-transparent-cwd-env: go-build docker-build
 
 smoke-transparent-timeout: go-build docker-build
 	bash -euo pipefail -c 'tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; printf "DR_HUMAN_LOG=0\n" >$$tmp/policy.env; start=$$(date +%s); set +e; ./bin/dynamorio-sandbox --session transparent-timeout --timeout 1s --timeout-kill-after 500ms --policy-file $$tmp/policy.env --workdir "$$(pwd)" -- /bin/bash -lc '\''sleep 30 & wait'\'' >$$tmp/out 2>$$tmp/err; rc=$$?; set -e; elapsed=$$(( $$(date +%s) - start )); test $$rc -eq 124; test $$elapsed -lt 10; test ! -s $$tmp/out; test -z "$$(docker ps -aq --filter name=dr-sandbox-transparent-timeout)"; echo transparent timeout ok elapsed=$$elapsed'
+
+smoke-transparent-shim: go-build docker-build
+	bash -euo pipefail -c 'tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; printf "DR_HUMAN_LOG=0\n" >$$tmp/policy.env; PATH="$$(pwd)/bin:$$PATH" EVALUATOR_SANDBOX=dr EVALUATOR_SANDBOX_CONFIG=$$tmp/policy.env EVALUATOR_SANDBOX_TIMEOUT=10s EVALUATOR_SANDBOX_WORKDIR="$$(pwd)" scripts/dr-evaluator-launch -- /bin/bash -lc '\''printf shim-ok'\'' >$$tmp/out; grep -qx shim-ok $$tmp/out; echo transparent shim ok'
 
 ## ── cleanup ─────────────────────────────────────────────────────
 
