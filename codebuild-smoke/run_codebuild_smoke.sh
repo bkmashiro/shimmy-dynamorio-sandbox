@@ -6,7 +6,7 @@ ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 PROJECT_NAME="${PROJECT_NAME:-shimmy-dynamorio-docker-smoke}"
 ROLE_NAME="${ROLE_NAME:-shimmy-codebuild-dynamorio-smoke-role}"
 BUCKET="${BUCKET:-shimmy-codebuild-sources-${ACCOUNT_ID}-${REGION}}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TS="$(date +%Y%m%d-%H%M%S)"
 SOURCE_KEY="dynamorio-docker-smoke/source-${TS}.zip"
 RESULT_KEY="dynamorio-docker-smoke/result-${TS}.json"
@@ -20,9 +20,8 @@ for c in aws zip python3; do
   command -v "$c" >/dev/null || { echo "missing $c" >&2; exit 1; }
 done
 
-mkdir -p "$WORK_DIR/proto-d-dynamorio"
-cp -R "$ROOT_DIR/proto-d-dynamorio"/* "$WORK_DIR/proto-d-dynamorio/"
-cp "$ROOT_DIR/proto-d-dynamorio/codebuild-smoke/buildspec.yml" "$WORK_DIR/buildspec.yml"
+rsync -a --exclude .git --exclude .cache --exclude bin --exclude /dynamorio-sandbox "$ROOT_DIR/" "$WORK_DIR/"
+cp "$ROOT_DIR/codebuild-smoke/buildspec.yml" "$WORK_DIR/buildspec.yml"
 ( cd "$WORK_DIR" && zip -q -r /tmp/dynamorio-smoke-source.zip . )
 
 if ! aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then

@@ -67,15 +67,75 @@ static int expect_mmap_alloc_block(void) {
     return 1;
 }
 
+static int expect_fd_write_policy(void) {
+    const char *path = "/tmp/dr-fd-shadow-policy.txt";
+    int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+    if (fd < 0) {
+        perror("open fd policy path");
+        return 1;
+    }
+    ssize_t n = write(fd, "x", 1);
+    int saved = errno;
+    close(fd);
+    unlink(path);
+    if (n < 0 && saved == EPERM) {
+        puts("fd write policy ok");
+        return 0;
+    }
+    fprintf(stderr, "fd write policy failed: n=%zd errno=%d (%s)\n", n, saved, strerror(saved));
+    return 1;
+}
+
+static int connect_to_ipv4(const char *ip, int port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 2;
+    }
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+        close(fd);
+        return 2;
+    }
+    int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    int saved = errno;
+    close(fd);
+    errno = saved;
+    return rc;
+}
+
+static int expect_network_policy(void) {
+    int rc = connect_to_ipv4("1.1.1.1", 80);
+    int saved = errno;
+    if (!(rc < 0 && saved == ENETDOWN)) {
+        fprintf(stderr, "network policy block failed: rc=%d errno=%d (%s)\n", rc, saved, strerror(saved));
+        return 1;
+    }
+
+    rc = connect_to_ipv4("127.0.0.1", 9);
+    saved = errno;
+    if (rc < 0 && saved == ENETDOWN) {
+        fprintf(stderr, "network policy allow failed: localhost was blocked\n");
+        return 1;
+    }
+    puts("network policy ok");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s readcap|socket|prot_exec|mmap_alloc\n", argv[0]);
+        fprintf(stderr, "usage: %s readcap|socket|prot_exec|mmap_alloc|fd_write_policy|network_policy\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "readcap") == 0) return expect_read_cap();
     if (strcmp(argv[1], "socket") == 0) return expect_socket_block();
     if (strcmp(argv[1], "prot_exec") == 0) return expect_prot_exec_block();
     if (strcmp(argv[1], "mmap_alloc") == 0) return expect_mmap_alloc_block();
+    if (strcmp(argv[1], "fd_write_policy") == 0) return expect_fd_write_policy();
+    if (strcmp(argv[1], "network_policy") == 0) return expect_network_policy();
     fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;
 }

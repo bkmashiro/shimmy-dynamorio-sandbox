@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <sys/mman.h>
 
 /* ── Linux x86-64 syscall numbers ───────────────────────────── */
@@ -355,12 +356,26 @@ typedef struct {
     char prefix[256];
 } path_policy_rule_t;
 
+typedef struct {
+    bool in_use;
+    bool block_write;
+    char path[512];
+} fd_shadow_t;
+
+typedef struct {
+    bool block;
+    bool any_ip;
+    char ip[64];
+    int port; /* -1 = any */
+} network_policy_rule_t;
+
 /* ── global state ────────────────────────────────────────────── */
 static char           g_session_id[64];
 static char           g_sandbox_root[256];   /* /tmp/dr-sandbox/<session-id>/ */
 static sandbox_mode_t g_mode = MODE_OBSERVE;
 static bool           g_redirect_tmp = true;
 static bool           g_audit_jsonl = false;
+static bool           g_semantic_audit = false;
 static bool           g_human_log = true;
 static size_t         g_max_read_bytes = MAX_READ_BYTES;
 static size_t         g_max_alloc_bytes = 0; /* 0 = unlimited; DR-only mmap/brk budget */
@@ -376,6 +391,14 @@ static int            g_proc_count = 0;
 static void          *g_mutex;
 static path_policy_rule_t g_path_rules[32];
 static int            g_path_rule_count = 0;
+static path_policy_rule_t g_fd_write_rules[32];
+static int            g_fd_write_rule_count = 0;
+static fd_shadow_t    g_fd_shadow[1024];
+static bool           g_pending_open;
+static bool           g_pending_open_block_write;
+static char           g_pending_open_path[512];
+static network_policy_rule_t g_network_rules[32];
+static int            g_network_rule_count = 0;
 static int            g_last_sysnum;
 static size_t         g_last_mmap_len;
 static size_t         g_last_mremap_old_len;
@@ -465,6 +488,37 @@ static void audit_syscall_event(const char *action, int sysnum)
                      g_mode == MODE_STRICT ? "strict" : "observe");
     audit_append_json_string(&p, end, action);
     p += dr_snprintf(p, (size_t)(end - p), ",\"syscall\":%d}\n", sysnum);
+    *p = '\0';
+    audit_write_line(line);
+}
+
+static void audit_semantic_event(const char *name, const char *action, int sysnum,
+                                 long fd, const char *path, const char *peer)
+{
+    if (!g_semantic_audit)
+        return;
+    char line[2048];
+    char *p = line;
+    char *end = line + sizeof(line) - 2;
+    audit_append_raw(&p, end, "{\"type\":\"semantic\",\"session\":");
+    audit_append_json_string(&p, end, g_session_id);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"mode\":\"%s\",\"name\":",
+                     g_mode == MODE_STRICT ? "strict" : "observe");
+    audit_append_json_string(&p, end, name);
+    audit_append_raw(&p, end, ",\"action\":");
+    audit_append_json_string(&p, end, action);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"syscall\":%d", sysnum);
+    if (fd >= 0)
+        p += dr_snprintf(p, (size_t)(end - p), ",\"fd\":%ld", fd);
+    if (path && *path) {
+        audit_append_raw(&p, end, ",\"path\":");
+        audit_append_json_string(&p, end, path);
+    }
+    if (peer && *peer) {
+        audit_append_raw(&p, end, ",\"peer\":");
+        audit_append_json_string(&p, end, peer);
+    }
+    audit_append_raw(&p, end, "}\n");
     *p = '\0';
     audit_write_line(line);
 }
@@ -723,6 +777,153 @@ static void parse_path_policy_rules(const char *spec)
     }
 }
 
+static void parse_fd_write_policy_rules(const char *spec)
+{
+    g_fd_write_rule_count = 0;
+    if (!spec || !*spec)
+        return;
+    const char *p = spec;
+    while (*p && g_fd_write_rule_count < (int)(sizeof(g_fd_write_rules) / sizeof(g_fd_write_rules[0]))) {
+        while (*p == ';' || *p == ',' || *p == ' ' || *p == '\t' || *p == '\n')
+            p++;
+        if (!*p)
+            break;
+        const char *action_start = p;
+        while (*p && *p != ':' && *p != '=')
+            p++;
+        if (!*p)
+            break;
+        const char *action_end = p++;
+        const char *path_start = p;
+        while (*p && *p != ';' && *p != ',')
+            p++;
+        const char *path_end = p;
+        while (path_end > path_start &&
+               (path_end[-1] == ' ' || path_end[-1] == '\t' || path_end[-1] == '\n'))
+            path_end--;
+        path_policy_action_t action;
+        if (parse_path_policy_action(action_start, (size_t)(action_end - action_start), &action) &&
+            path_end > path_start) {
+            char raw[256];
+            size_t len = (size_t)(path_end - path_start);
+            if (len >= sizeof(raw)) len = sizeof(raw) - 1;
+            memcpy(raw, path_start, len);
+            raw[len] = '\0';
+            path_policy_rule_t *rule = &g_fd_write_rules[g_fd_write_rule_count++];
+            rule->action = action;
+            if (raw[0] == '/')
+                canonicalize_path(raw, rule->prefix, sizeof(rule->prefix));
+            else {
+                size_t rlen = strlen(raw);
+                if (rlen >= sizeof(rule->prefix)) rlen = sizeof(rule->prefix) - 1;
+                memcpy(rule->prefix, raw, rlen);
+                rule->prefix[rlen] = '\0';
+            }
+        }
+    }
+}
+
+static path_policy_action_t fd_write_policy_for(const char *path)
+{
+    if (!path || !*path || g_fd_write_rule_count <= 0)
+        return PATH_POLICY_DEFAULT;
+    char canonical[512];
+    if (path[0] == '/')
+        canonicalize_path(path, canonical, sizeof(canonical));
+    else {
+        size_t plen = strlen(path);
+        if (plen >= sizeof(canonical)) plen = sizeof(canonical) - 1;
+        memcpy(canonical, path, plen);
+        canonical[plen] = '\0';
+    }
+    for (int i = 0; i < g_fd_write_rule_count; i++) {
+        if (path_has_prefix_component(canonical, g_fd_write_rules[i].prefix))
+            return g_fd_write_rules[i].action;
+    }
+    return PATH_POLICY_DEFAULT;
+}
+
+static uint16_t bswap16(uint16_t v)
+{
+    return (uint16_t)((v >> 8) | (v << 8));
+}
+
+static void parse_network_policy_rules(const char *spec)
+{
+    g_network_rule_count = 0;
+    if (!spec || !*spec)
+        return;
+    const char *p = spec;
+    while (*p && g_network_rule_count < (int)(sizeof(g_network_rules) / sizeof(g_network_rules[0]))) {
+        while (*p == ';' || *p == ',' || *p == ' ' || *p == '\t' || *p == '\n')
+            p++;
+        if (!*p)
+            break;
+        const char *action_start = p;
+        while (*p && *p != ':') p++;
+        if (!*p) break;
+        const char *action_end = p++;
+        const char *host_start = p;
+        while (*p && *p != ':' && *p != ';' && *p != ',') p++;
+        const char *host_end = p;
+        int port = -1;
+        if (*p == ':') {
+            p++;
+            if (*p == '*') {
+                port = -1;
+                p++;
+            } else {
+                port = (int)strtol(p, (char **)&p, 10);
+            }
+        }
+        while (*p && *p != ';' && *p != ',') p++;
+        if (host_end <= host_start)
+            continue;
+        network_policy_rule_t *rule = &g_network_rules[g_network_rule_count++];
+        rule->block = (action_end - action_start == 5 && strncmp(action_start, "block", 5) == 0) ||
+                      (action_end - action_start == 4 && strncmp(action_start, "deny", 4) == 0);
+        rule->port = port;
+        size_t hlen = (size_t)(host_end - host_start);
+        if (hlen >= sizeof(rule->ip)) hlen = sizeof(rule->ip) - 1;
+        memcpy(rule->ip, host_start, hlen);
+        rule->ip[hlen] = '\0';
+        rule->any_ip = strcmp(rule->ip, "*") == 0;
+    }
+}
+
+static bool read_ipv4_peer(void *drcontext, reg_t sockaddr_ptr, char *peer, size_t peersz,
+                           char *ip, size_t ipsz, int *port)
+{
+    (void)drcontext;
+    unsigned char raw[16];
+    if (!dr_safe_read((void *)(uintptr_t)sockaddr_ptr, sizeof(raw), raw, NULL))
+        return false;
+    uint16_t family;
+    memcpy(&family, raw, sizeof(family));
+    if (family != 2) /* AF_INET */
+        return false;
+    uint16_t nport;
+    memcpy(&nport, raw + 2, sizeof(nport));
+    *port = (int)bswap16(nport);
+    dr_snprintf(ip, ipsz, "%u.%u.%u.%u", raw[4], raw[5], raw[6], raw[7]);
+    dr_snprintf(peer, peersz, "%s:%d", ip, *port);
+    return true;
+}
+
+static bool network_policy_blocks_peer(const char *ip, int port, bool default_block)
+{
+    if (g_network_rule_count <= 0)
+        return default_block;
+    for (int i = 0; i < g_network_rule_count; i++) {
+        network_policy_rule_t *rule = &g_network_rules[i];
+        bool ip_match = rule->any_ip || strcmp(rule->ip, ip) == 0;
+        bool port_match = rule->port < 0 || rule->port == port;
+        if (ip_match && port_match)
+            return rule->block;
+    }
+    return default_block;
+}
+
 static path_policy_action_t configured_path_policy_for(const char *path)
 {
     if (g_path_rule_count <= 0)
@@ -964,6 +1165,32 @@ static bool read_app_string(void *drcontext, reg_t ptr, char *buf, size_t bufsz)
     return true;
 }
 
+static void fd_shadow_clear(int fd)
+{
+    if (fd >= 0 && fd < (int)(sizeof(g_fd_shadow) / sizeof(g_fd_shadow[0])))
+        memset(&g_fd_shadow[fd], 0, sizeof(g_fd_shadow[fd]));
+}
+
+static void fd_shadow_set(int fd, const char *path, bool block_write)
+{
+    if (fd < 0 || fd >= (int)(sizeof(g_fd_shadow) / sizeof(g_fd_shadow[0])) || !path)
+        return;
+    g_fd_shadow[fd].in_use = true;
+    g_fd_shadow[fd].block_write = block_write;
+    size_t len = strlen(path);
+    if (len >= sizeof(g_fd_shadow[fd].path)) len = sizeof(g_fd_shadow[fd].path) - 1;
+    memcpy(g_fd_shadow[fd].path, path, len);
+    g_fd_shadow[fd].path[len] = '\0';
+}
+
+static fd_shadow_t *fd_shadow_get(int fd)
+{
+    if (fd < 0 || fd >= (int)(sizeof(g_fd_shadow) / sizeof(g_fd_shadow[0])) ||
+        !g_fd_shadow[fd].in_use)
+        return NULL;
+    return &g_fd_shadow[fd];
+}
+
 /* ══════════════════════════════════════════════════════════════
  *  PRE-SYSCALL EVENT
  * ══════════════════════════════════════════════════════════════ */
@@ -986,6 +1213,14 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
     g_last_mremap_old_len = 0;
     g_last_mremap_new_len = 0;
     g_last_munmap_len = 0;
+    g_pending_open = false;
+
+    if (sysnum == SYS_close) {
+        int fd = (int)dr_syscall_get_param(drcontext, 0);
+        audit_semantic_event("close", "allow", sysnum, fd, fd_shadow_get(fd) ? fd_shadow_get(fd)->path : NULL, NULL);
+        fd_shadow_clear(fd);
+        return true;
+    }
 
     /* ── ALWAYS ALLOWED ──────────────────────────────────────── */
     switch (sysnum) {
@@ -1107,6 +1342,14 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             return false;
         }
 
+        g_pending_open = true;
+        g_pending_open_block_write = fd_write_policy_for(orig) == PATH_POLICY_BLOCK;
+        size_t open_path_len = strlen(orig);
+        if (open_path_len >= sizeof(g_pending_open_path)) open_path_len = sizeof(g_pending_open_path) - 1;
+        memcpy(g_pending_open_path, orig, open_path_len);
+        g_pending_open_path[open_path_len] = '\0';
+        audit_semantic_event("open", "allow", sysnum, -1, orig, NULL);
+
         bool should_redirect = policy == PATH_POLICY_PRIVATE;
         if (!should_redirect) {
             if (g_mode == MODE_OBSERVE) {
@@ -1194,6 +1437,15 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
     /* --- configurable non-path controls ----------------------- */
     if (sysnum == SYS_write || sysnum == SYS_writev || sysnum == SYS_pwrite64) {
         reg_t fd = dr_syscall_get_param(drcontext, 0);
+        fd_shadow_t *shadow = fd_shadow_get((int)fd);
+        if (shadow && shadow->block_write) {
+            LOG("BLOCK fd write: fd=%ld path=%s", (long)fd, shadow->path);
+            audit_semantic_event("write", "block", sysnum, (long)fd, shadow->path, NULL);
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, EPERM);
+            return false;
+        }
+        audit_semantic_event("write", "allow", sysnum, (long)fd, shadow ? shadow->path : NULL, NULL);
         if (g_stdio_only_writes && fd != 1 && fd != 2) {
             LOG("BLOCK write: fd=%ld", (long)fd);
             audit_syscall_event("block", sysnum);
@@ -1288,12 +1540,42 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
 
     switch (sysnum) {
         case SYS_socket:
+        case SYS_socketpair:
+            if (g_block_network && g_network_rule_count <= 0) {
+                LOG("BLOCK network syscall %d", sysnum);
+                audit_syscall_event("block", sysnum);
+                set_errno_result(drcontext, ENETDOWN);
+                return false;
+            }
+            audit_semantic_event("socket", "allow", sysnum, -1, NULL, NULL);
+            return true;
         case SYS_connect:
         case SYS_bind:
+        case SYS_sendto: {
+            char peer[96] = "";
+            char ip[64] = "";
+            int port = -1;
+            bool have_peer = false;
+            if (sysnum == SYS_sendto)
+                have_peer = read_ipv4_peer(drcontext, dr_syscall_get_param(drcontext, 4), peer, sizeof(peer), ip, sizeof(ip), &port);
+            else
+                have_peer = read_ipv4_peer(drcontext, dr_syscall_get_param(drcontext, 1), peer, sizeof(peer), ip, sizeof(ip), &port);
+            bool block = have_peer ? network_policy_blocks_peer(ip, port, g_block_network) : g_block_network;
+            if (block) {
+                LOG("BLOCK network syscall %d peer=%s", sysnum, have_peer ? peer : "unknown");
+                audit_semantic_event(sysnum == SYS_connect ? "connect" : (sysnum == SYS_bind ? "bind" : "sendto"),
+                                     "block", sysnum, -1, NULL, have_peer ? peer : NULL);
+                audit_syscall_event("block", sysnum);
+                set_errno_result(drcontext, ENETDOWN);
+                return false;
+            }
+            audit_semantic_event(sysnum == SYS_connect ? "connect" : (sysnum == SYS_bind ? "bind" : "sendto"),
+                                 "allow", sysnum, -1, NULL, have_peer ? peer : NULL);
+            return true;
+        }
         case SYS_listen:
         case SYS_accept:
         case SYS_accept4:
-        case SYS_sendto:
         case SYS_recvfrom:
         case SYS_sendmsg:
         case SYS_recvmsg:
@@ -1302,10 +1584,9 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         case SYS_shutdown:
         case SYS_getsockname:
         case SYS_getpeername:
-        case SYS_socketpair:
         case SYS_setsockopt:
         case SYS_getsockopt:
-            if (g_block_network) {
+            if (g_block_network && g_network_rule_count <= 0) {
                 LOG("BLOCK network syscall %d", sysnum);
                 audit_syscall_event("block", sysnum);
                 set_errno_result(drcontext, ENETDOWN);
@@ -1489,6 +1770,15 @@ static void event_post_syscall(void *drcontext, int sysnum)
         return;
     reg_t result = info.value;
 
+    if ((sysnum == SYS_open || sysnum == SYS_openat || sysnum == SYS_creat) &&
+        g_pending_open && info.succeeded) {
+        int fd = (int)result;
+        fd_shadow_set(fd, g_pending_open_path, g_pending_open_block_write);
+        audit_semantic_event("fd", g_pending_open_block_write ? "track-block-write" : "track", sysnum,
+                             fd, g_pending_open_path, NULL);
+        return;
+    }
+
     if (sysnum == SYS_mmap) {
         if (g_last_sysnum == SYS_mmap && g_last_mmap_len > 0 && info.succeeded)
             alloc_budget_add(g_last_mmap_len);
@@ -1572,6 +1862,9 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
     g_block_exec = env_policy_blocks(getenv("DR_EXEC"), g_block_exec);
     g_block_prot_exec = env_policy_blocks(getenv("DR_PROT_EXEC"), g_block_prot_exec);
     g_stdio_only_writes = env_policy_blocks(getenv("DR_FILE_WRITE"), g_stdio_only_writes);
+    g_semantic_audit = env_is_true(getenv("DR_SEMANTIC_AUDIT"));
+    if (g_semantic_audit)
+        g_audit_jsonl = true;
 
     const char *env_audit_jsonl = getenv("DR_AUDIT_JSONL");
     if (env_audit_jsonl && *env_audit_jsonl &&
@@ -1599,6 +1892,8 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
 
     const char *env_path_policy = getenv("DR_PATH_POLICY");
     parse_path_policy_rules(env_path_policy);
+    parse_fd_write_policy_rules(getenv("DR_FD_WRITE_POLICY"));
+    parse_network_policy_rules(getenv("DR_NETWORK_POLICY"));
 
     ensure_private_dirs();
 

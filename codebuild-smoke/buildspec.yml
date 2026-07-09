@@ -7,7 +7,6 @@ phases:
   build:
     commands:
       - set -euo pipefail
-      - cd proto-d-dynamorio
       - make docker-build
       - make smoke-private-tmp
       - make smoke-audit-jsonl

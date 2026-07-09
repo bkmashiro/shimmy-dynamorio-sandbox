@@ -23,9 +23,12 @@ DR_MODE        ?= observe
 DR_REDIRECT_TMP ?= 1
 DR_PATH_POLICY ?=
 DR_NETWORK     ?=
+DR_NETWORK_POLICY ?=
 DR_EXEC        ?=
 DR_PROT_EXEC   ?=
 DR_FILE_WRITE  ?=
+DR_FD_WRITE_POLICY ?=
+DR_SEMANTIC_AUDIT ?=
 DR_MAX_READ_BYTES ?=
 DR_MAX_ALLOC_BYTES ?=
 DR_MAX_PROCS   ?=
@@ -71,9 +74,12 @@ docker-run:
 	    -e DR_REDIRECT_TMP=$(DR_REDIRECT_TMP) \
 	    -e DR_PATH_POLICY='$(DR_PATH_POLICY)' \
 	    -e DR_NETWORK='$(DR_NETWORK)' \
+	    -e DR_NETWORK_POLICY='$(DR_NETWORK_POLICY)' \
 	    -e DR_EXEC='$(DR_EXEC)' \
 	    -e DR_PROT_EXEC='$(DR_PROT_EXEC)' \
 	    -e DR_FILE_WRITE='$(DR_FILE_WRITE)' \
+	    -e DR_FD_WRITE_POLICY='$(DR_FD_WRITE_POLICY)' \
+	    -e DR_SEMANTIC_AUDIT='$(DR_SEMANTIC_AUDIT)' \
 	    -e DR_MAX_READ_BYTES='$(DR_MAX_READ_BYTES)' \
 	    -e DR_MAX_ALLOC_BYTES='$(DR_MAX_ALLOC_BYTES)' \
 	    -e DR_MAX_PROCS='$(DR_MAX_PROCS)' \
@@ -197,6 +203,30 @@ smoke-runtime-config: docker-build
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls mmap_alloc
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-fd \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_FD_WRITE_POLICY=block:/tmp/dr-fd-shadow-policy.txt \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls fd_write_policy
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-netpolicy \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e 'DR_NETWORK_POLICY=allow:127.0.0.1:9;block:*' \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls network_policy
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-semaudit \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_FD_WRITE_POLICY=block:/tmp/dr-fd-shadow-policy.txt \
+	    -e DR_SEMANTIC_AUDIT=1 \
+	    -e DR_AUDIT_PATH=/tmp/dr-semantic-audit.jsonl \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -euo pipefail -lc 'rm -f /tmp/dr-semantic-audit.jsonl /tmp/dr-fd-shadow-policy.txt; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls fd_write_policy; grep -q "\"type\":\"semantic\"" /tmp/dr-semantic-audit.jsonl; grep -q "\"name\":\"open\"" /tmp/dr-semantic-audit.jsonl; grep -q "\"name\":\"write\"" /tmp/dr-semantic-audit.jsonl; grep -q "\"action\":\"block\"" /tmp/dr-semantic-audit.jsonl; echo semantic audit ok $$(wc -l </tmp/dr-semantic-audit.jsonl)'
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 
