@@ -33,7 +33,7 @@ DR_MAX_READ_BYTES ?=
 DR_MAX_ALLOC_BYTES ?=
 DR_MAX_PROCS   ?=
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env smoke-transparent-timeout clean
 
 all: client test-prog
 
@@ -241,6 +241,9 @@ smoke-transparent-exit-code: go-build docker-build
 
 smoke-transparent-cwd-env: go-build docker-build
 	bash -euo pipefail -c 'tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; printf "DR_HUMAN_LOG=0\n" >$$tmp/policy.env; ./bin/dynamorio-sandbox --timeout 10s --policy-file $$tmp/policy.env --env EVALUATOR_MARK=ok --workdir "$$(pwd)" -- /bin/bash -lc '\''test "$$PWD" = "'"$$(pwd)"'"; test "$$EVALUATOR_MARK" = ok; test -f README.md; printf cwd-env-ok'\'' >$$tmp/out; grep -qx cwd-env-ok $$tmp/out; echo transparent cwd/env ok'
+
+smoke-transparent-timeout: go-build docker-build
+	bash -euo pipefail -c 'tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; printf "DR_HUMAN_LOG=0\n" >$$tmp/policy.env; start=$$(date +%s); set +e; ./bin/dynamorio-sandbox --session transparent-timeout --timeout 1s --timeout-kill-after 500ms --policy-file $$tmp/policy.env --workdir "$$(pwd)" -- /bin/bash -lc '\''sleep 30 & wait'\'' >$$tmp/out 2>$$tmp/err; rc=$$?; set -e; elapsed=$$(( $$(date +%s) - start )); test $$rc -eq 124; test $$elapsed -lt 10; test ! -s $$tmp/out; test -z "$$(docker ps -aq --filter name=dr-sandbox-transparent-timeout)"; echo transparent timeout ok elapsed=$$elapsed'
 
 ## ── cleanup ─────────────────────────────────────────────────────
 

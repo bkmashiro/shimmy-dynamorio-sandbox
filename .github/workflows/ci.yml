@@ -65,7 +65,7 @@ jobs:
       - name: Build image and run transparent launcher smokes
         run: |
           set -euo pipefail
-          make smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env
+          make smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env smoke-transparent-timeout
 
   deep-runtime-smoke:
     name: Deep DynamoRIO runtime smoke

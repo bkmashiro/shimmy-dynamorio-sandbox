@@ -42,6 +42,16 @@ func TestParseCLIKeepsLegacyExecArgs(t *testing.T) {
 	}
 }
 
+func TestParseCLIRejectsNonPositiveTimeoutKillAfter(t *testing.T) {
+	_, err := parseCLI([]string{"--timeout-kill-after", "0s", "--", "/bin/echo", "ok"})
+	if err == nil {
+		t.Fatalf("parseCLI accepted non-positive --timeout-kill-after")
+	}
+	if !strings.Contains(err.Error(), "--timeout-kill-after must be positive") {
+		t.Fatalf("parseCLI error = %q, want timeout-kill-after validation", err)
+	}
+}
+
 func TestLoadPolicyFileMergesEnvWithoutChangingCommand(t *testing.T) {
 	f, err := os.CreateTemp(t.TempDir(), "policy-*.env")
 	if err != nil {
@@ -113,6 +123,13 @@ func TestContainerNameSanitizesSessionID(t *testing.T) {
 	want := "dr-sandbox-job-Case-42-with-spaces"
 	if got != want {
 		t.Fatalf("containerName = %q, want %q", got, want)
+	}
+}
+
+func TestContainerNameFallsBackForEmptySessionID(t *testing.T) {
+	got := containerName("///")
+	if got != "dr-sandbox-session" {
+		t.Fatalf("containerName fallback = %q", got)
 	}
 }
 

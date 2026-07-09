@@ -191,6 +191,7 @@ Required transparency rules:
 - Docker `--init` so child processes are reaped inside the carrier.
 - Stable sanitized container name, enabling future cleanup/probe hooks by session ID.
 - Dry-run/build-args tests for exact timeout and container options.
+- `smoke-transparent-timeout` exercises a timed-out evaluator that spawns a child, requires exit code `124`, checks wall completion stays bounded, and verifies the named Docker carrier is removed after timeout.
 
 **Done when:** timeout reliably kills the whole evaluator tree and reports a deterministic exit code.
 
