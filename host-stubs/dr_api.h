@@ -21,6 +21,7 @@ typedef uint32_t  client_id_t;
 typedef void     *dr_context_t;   /* opaque */
 typedef void     *drcontext_t;    /* per-thread context */
 typedef uintptr_t reg_t;
+typedef uint32_t  uint;
 typedef uint64_t  uint64;
 typedef int       file_t;         /* DynamoRIO uses int for file handles */
 
@@ -44,8 +45,21 @@ static inline reg_t dr_syscall_get_param(void *ctx, int param_num)
 static inline void dr_syscall_set_param(void *ctx, int param_num, reg_t val)
     { (void)ctx; (void)param_num; (void)val; }
 
+typedef struct _dr_syscall_result_info_t {
+    size_t size;
+    bool succeeded;
+    bool use_high;
+    reg_t high;
+    reg_t value;
+    bool use_errno;
+    uint errno_value;
+} dr_syscall_result_info_t;
+
 static inline void dr_syscall_set_result(void *ctx, uintptr_t val)
     { (void)ctx; (void)val; }
+
+static inline bool dr_syscall_set_result_ex(void *ctx, dr_syscall_result_info_t *info)
+    { (void)ctx; (void)info; return true; }
 
 /* ── Safe memory access ──────────────────────────────────────── */
 static inline bool dr_safe_read(const void *base, size_t size, void *out_buf,
@@ -107,6 +121,9 @@ static inline bool dr_create_dir(const char *path)
 
 /* ── Registration ────────────────────────────────────────────── */
 typedef bool (*dr_pre_syscall_event_t)(void *drcontext, int sysnum);
+typedef bool (*dr_filter_syscall_event_t)(void *drcontext, int sysnum);
+static inline void dr_register_filter_syscall_event(dr_filter_syscall_event_t cb)
+    { (void)cb; }
 static inline void dr_register_pre_syscall_event(dr_pre_syscall_event_t cb)
     { (void)cb; }
 

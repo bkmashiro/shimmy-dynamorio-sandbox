@@ -2,6 +2,22 @@
 
 A prototype sandbox using [DynamoRIO](https://dynamorio.org/) for **syscall virtualization** — not just allow/block, but intercepting syscalls and replacing them with safe, controlled behavior.
 
+## Current Docker-first Wolfram direction
+
+For Wolfram/LambdaFeedback-style work, use Docker/regular container runtime as the primary target. AWS Lambda is only a side/negative target unless the explicit goal is a Wolfram-on-Lambda port.
+
+This prototype now supports two runtime modes:
+
+| Env | Behavior |
+|---|---|
+| `DR_SANDBOX_MODE=observe` | Compatibility-first: log syscalls, pass most through, and redirect private writable temp/cache paths when enabled. This is the default for complex runtimes such as Wolfram. |
+| `DR_SANDBOX_MODE=strict` / `enforce` | Original deny-by-default sandbox policy. Useful as a canary, too restrictive for Wolfram first-pass integration. |
+| `DR_REDIRECT_TMP=1` | Redirect write/create opens under `/tmp`, `/var/tmp`, `/.Wolfram`, and `/.cache` into `/tmp/dr-sandbox/<session-id>/...`. |
+
+Use observe mode first, then derive a narrower enforce profile from logs. Do not start by blocking everything: Wolfram may legitimately write license/cache/paclet/temp files.
+
+See `docker-first-wolfram-dynamorio-roadmap-20260709.md` for the current scope and verified CodeBuild smoke.
+
 ## Architecture
 
 ```
@@ -82,11 +98,17 @@ The Go wrapper auto-generates the session ID; pass `--session` to fix it for rep
 # Build image
 make docker-build
 
-# Run the demo (test_open tries to open /etc/passwd)
+# Run the demo (strict mode: test_open tries to open /etc/passwd)
 make demo
 
-# Run an arbitrary program
+# Verify observe-mode private tmp redirection on native x86_64/CodeBuild
+make smoke-private-tmp
+
+# Run an arbitrary program in observe mode
 make docker-run EXEC=/bin/ls EXEC_ARGS="/tmp"
+
+# Run an arbitrary program in strict/enforce mode
+make docker-run DR_MODE=strict EXEC=/bin/ls EXEC_ARGS="/tmp"
 
 # Use the Go wrapper
 go run ./cmd/dynamorio-sandbox --exec /bin/ls --args "/tmp" --timeout 10s

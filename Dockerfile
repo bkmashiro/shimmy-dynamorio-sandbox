@@ -26,10 +26,10 @@ RUN wget -q "https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-
     rm /tmp/dynamorio.tar.gz
 
 WORKDIR /build
-COPY syscall_filter.c test_open.c Makefile ./
+COPY syscall_filter.c test_open.c test_tmp_write.c Makefile ./
 
-# Build client + test binary
-# DynamoRIO v11: libdrcontainers moved to ext/lib64/release; requires -DLINUX -DX86_64
+# Build client + test binaries.
+# DynamoRIO v11: libdrcontainers moved to ext/lib64/release; requires -DLINUX -DX86_64.
 RUN DR=${DYNAMORIO_HOME} && \
     gcc -shared -fPIC -O2 -Wall -Wextra \
         -DLINUX -DX86_64 -include stdint.h \
@@ -38,7 +38,8 @@ RUN DR=${DYNAMORIO_HOME} && \
         -o syscall_filter.so syscall_filter.c \
         -L${DR}/lib64/release -ldynamorio \
         -L${DR}/ext/lib64/release -ldrcontainers && \
-    gcc -static -O2 -o test_open test_open.c
+    gcc -static -O2 -o test_open test_open.c && \
+    gcc -static -O2 -o test_tmp_write test_tmp_write.c
 
 # ── Runtime image ──────────────────────────────────────────────
 FROM --platform=linux/amd64 ubuntu:22.04
@@ -56,6 +57,7 @@ COPY --from=builder /opt/dynamorio /opt/dynamorio
 # Copy our built artifacts
 COPY --from=builder /build/syscall_filter.so /opt/sandbox/syscall_filter.so
 COPY --from=builder /build/test_open         /opt/sandbox/test_open
+COPY --from=builder /build/test_tmp_write    /opt/sandbox/test_tmp_write
 
 # Ensure sandbox base dir exists
 RUN mkdir -p /tmp/dr-sandbox

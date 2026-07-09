@@ -1,0 +1,29 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  build:
+    commands:
+      - set -euo pipefail
+      - cd proto-d-dynamorio
+      - make docker-build
+      - make smoke-private-tmp
+      - make demo
+      - |
+        python3 - <<'PY'
+        import json, os, pathlib, subprocess, time
+        out = {
+            "status": "passed",
+            "timestamp": int(time.time()),
+            "checks": ["make docker-build", "make smoke-private-tmp", "make demo"],
+            "note": "Executed on CodeBuild native x86_64 Linux; Apple Silicon Docker Desktop amd64 emulation is not a valid DynamoRIO runtime gate.",
+        }
+        p = pathlib.Path('/tmp/dynamorio-codebuild-smoke-result.json')
+        p.write_text(json.dumps(out, indent=2))
+        uri = os.environ.get('RESULT_S3_URI')
+        if uri:
+            subprocess.check_call(['aws', 's3', 'cp', str(p), uri])
+        print(json.dumps(out, indent=2))
+        PY

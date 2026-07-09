@@ -2,7 +2,7 @@
 #
 # Targets:
 #   client      – build syscall_filter.so (inside Docker)
-#   test-prog   – build test_open static binary (inside Docker)
+#   test-prog   – build test_open/test_tmp_write static binaries (inside Docker)
 #   docker-build – build the Docker image
 #   docker-run   – run a command under DynamoRIO in Docker
 #   demo        – full end-to-end demo
@@ -21,8 +21,10 @@ EXEC_ARGS      ?= hello from sandbox
 TIMEOUT        ?= 30
 MAX_MEM        ?= 256m
 MAX_PROCS      ?= 5
+DR_MODE        ?= observe
+DR_REDIRECT_TMP ?= 1
 
-.PHONY: all client test-prog docker-build docker-run demo clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp clean
 
 all: client test-prog
 
@@ -38,9 +40,12 @@ syscall_filter.so: syscall_filter.c
 	    -L$(DYNAMORIO_HOME)/lib64/release \
 	    -ldynamorio
 
-test-prog: test_open
+test-prog: test_open test_tmp_write
 
 test_open: test_open.c
+	$(CC) -static -O2 -o $@ $<
+
+test_tmp_write: test_tmp_write.c
 	$(CC) -static -O2 -o $@ $<
 
 ## ── Docker targets ──────────────────────────────────────────────
@@ -53,6 +58,8 @@ docker-build:
 docker-run:
 	docker run --rm \
 	    -e DR_SESSION_ID=$(SESSION_ID) \
+	    -e DR_SANDBOX_MODE=$(DR_MODE) \
+	    -e DR_REDIRECT_TMP=$(DR_REDIRECT_TMP) \
 	    --memory=$(MAX_MEM) \
 	    --pids-limit=$(MAX_PROCS) \
 	    --security-opt seccomp=unconfined \
@@ -64,18 +71,32 @@ docker-run:
 	        -- $(EXEC) $(EXEC_ARGS)
 
 # Run the built-in test binary
+# NOTE: DynamoRIO x86_64 currently crashes under Docker Desktop's amd64-on-arm64
+# emulation on Apple Silicon. Use this on native x86_64 Linux or CodeBuild.
 demo: docker-build
 	@echo "=== Running test_open WITHOUT DynamoRIO ==="
 	docker run --rm $(IMAGE_NAME) /opt/sandbox/test_open
 	@echo ""
-	@echo "=== Running test_open WITH DynamoRIO (syscall virtualization) ==="
+	@echo "=== Running test_open WITH DynamoRIO strict mode (syscall virtualization) ==="
 	docker run --rm \
 	    -e DR_SESSION_ID=demo-session \
+	    -e DR_SANDBOX_MODE=strict \
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    $(DYNAMORIO_HOME)/bin64/drrun \
 	        -c /opt/sandbox/syscall_filter.so \
 	        -- /opt/sandbox/test_open
+
+# Verify observe-mode private tmp redirection. Intended for native x86_64 Linux
+# or CodeBuild; Docker Desktop's amd64 emulation is not a valid DR runtime gate.
+smoke-private-tmp: docker-build
+	docker run --rm \
+	    -e DR_SESSION_ID=tmp-smoke \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_REDIRECT_TMP=1 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -lc 'rm -f /tmp/shimmy-dr-tmp-side-effect.txt; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_tmp_write; test ! -e /tmp/shimmy-dr-tmp-side-effect.txt; test -f /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-tmp-side-effect.txt'
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 

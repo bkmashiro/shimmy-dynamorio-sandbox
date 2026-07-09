@@ -336,13 +336,21 @@ static const char *BLOCKED_EXACT[] = {
     NULL
 };
 
-/* ── global state ────────────────────────────────────────────── */
-static char    g_session_id[64];
-static char    g_sandbox_root[256];   /* /tmp/dr-sandbox/<session-id>/ */
-static int     g_proc_count = 0;
-static void   *g_mutex;
+/* ── runtime mode ────────────────────────────────────────────── */
+typedef enum {
+    MODE_OBSERVE = 0,  /* log/interpose only selected virtualized paths; otherwise pass through */
+    MODE_STRICT  = 1,  /* original deny-by-default sandbox policy */
+} sandbox_mode_t;
 
-static file_t  g_log;                 /* DynamoRIO file handle for stderr */
+/* ── global state ────────────────────────────────────────────── */
+static char           g_session_id[64];
+static char           g_sandbox_root[256];   /* /tmp/dr-sandbox/<session-id>/ */
+static sandbox_mode_t g_mode = MODE_OBSERVE;
+static bool           g_redirect_tmp = true;
+static int            g_proc_count = 0;
+static void          *g_mutex;
+
+static file_t         g_log;                 /* DynamoRIO file handle for stderr */
 
 /* ── logging helper ──────────────────────────────────────────── */
 #define LOG(fmt, ...) \
@@ -417,6 +425,16 @@ static void canonicalize_path(const char *path, char *out, size_t outsz)
     }
 }
 
+/* ── path utility: check if path starts with a prefix at a component boundary ── */
+static bool path_has_prefix_component(const char *path, const char *prefix)
+{
+    size_t plen = strlen(prefix);
+    if (strncmp(path, prefix, plen) != 0)
+        return false;
+    char c = path[plen];
+    return c == '\0' || c == '/';
+}
+
 /* ── path utility: check if path starts with a blocked prefix ── */
 /*
  * Canonicalizes the path first to resolve ".." traversal attempts,
@@ -466,9 +484,69 @@ static bool remap_path(const char *orig, char *out, size_t outsz)
     return (n > 0 && (size_t)n < outsz);
 }
 
+static bool open_flags_write_intent(int flags)
+{
+    int accmode = flags & O_ACCMODE;
+    return accmode == O_WRONLY || accmode == O_RDWR ||
+           (flags & (O_CREAT | O_TRUNC | O_APPEND)) != 0;
+}
+
+static bool path_is_private_write_candidate(const char *path)
+{
+    char canonical[512];
+    if (path[0] == '/')
+        canonicalize_path(path, canonical, sizeof(canonical));
+    else {
+        size_t plen = strlen(path);
+        if (plen >= sizeof(canonical)) plen = sizeof(canonical) - 1;
+        memcpy(canonical, path, plen);
+        canonical[plen] = '\0';
+    }
+
+    if (path_has_prefix_component(canonical, "/tmp") ||
+        path_has_prefix_component(canonical, "/var/tmp"))
+        return true;
+
+    /* Wolfram and many language runtimes write caches/state below HOME.  Keep
+     * this broad in observe mode so we can get complex commercial runtimes to
+     * start, while still making those writes disposable.
+     */
+    if (strstr(canonical, "/.Wolfram") != NULL ||
+        strstr(canonical, "/.cache") != NULL)
+        return true;
+
+    return false;
+}
+
+static void ensure_private_dirs(void)
+{
+    char path[256];
+    dr_create_dir(SANDBOX_BASE);
+    dr_create_dir(g_sandbox_root);
+
+    dr_snprintf(path, sizeof(path), "%stmp", g_sandbox_root);
+    dr_create_dir(path);
+    dr_snprintf(path, sizeof(path), "%svar", g_sandbox_root);
+    dr_create_dir(path);
+    dr_snprintf(path, sizeof(path), "%svar/tmp", g_sandbox_root);
+    dr_create_dir(path);
+}
+
+static void set_errno_result(void *drcontext, int err)
+{
+    dr_syscall_result_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    info.succeeded = false;
+    info.use_errno = true;
+    info.errno_value = (uint)err;
+    dr_syscall_set_result_ex(drcontext, &info);
+}
+
 /* ── helper: read string from app memory ────────────────────── */
 static bool read_app_string(void *drcontext, reg_t ptr, char *buf, size_t bufsz)
 {
+    (void)drcontext;
     size_t sofar = 0;
     while (sofar < bufsz - 1) {
         char c;
@@ -576,51 +654,59 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
 
     /* ── VIRTUALIZED ─────────────────────────────────────────── */
 
-    /* --- open / openat: path remapping ----------------------- */
+    /* --- open / openat / creat: observe or private scratch remap -------- */
     if (sysnum == SYS_open || sysnum == SYS_openat || sysnum == SYS_creat) {
         reg_t path_arg;
-        if (sysnum == SYS_openat)
+        int flags = 0;
+        if (sysnum == SYS_openat) {
             path_arg = dr_syscall_get_param(drcontext, 1);  /* dirfd, path, flags */
-        else
+            flags = (int)dr_syscall_get_param(drcontext, 2);
+        } else if (sysnum == SYS_creat) {
+            path_arg = dr_syscall_get_param(drcontext, 0);  /* path, mode */
+            flags = O_WRONLY | O_CREAT | O_TRUNC;
+        } else {
             path_arg = dr_syscall_get_param(drcontext, 0);  /* path, flags */
+            flags = (int)dr_syscall_get_param(drcontext, 1);
+        }
 
         char orig[512];
         if (!read_app_string(drcontext, path_arg, orig, sizeof(orig))) {
-            dr_syscall_set_result(drcontext, -EPERM);
+            set_errno_result(drcontext, EPERM);
             return false;
         }
 
-        /* reject blocked prefixes; use ENOENT for shadow to avoid leaking existence */
-        if (path_is_blocked(orig)) {
+        if (g_mode == MODE_STRICT && path_is_blocked(orig)) {
             LOG("BLOCK open: %s", orig);
-            /* /etc/shadow: return ENOENT to avoid leaking that the file exists */
             if (strncmp(orig, "/etc/shadow", 11) == 0 &&
-                    (orig[11] == '\0' || orig[11] == '/')) {
-                dr_syscall_set_result(drcontext, -ENOENT);
-            } else {
-                dr_syscall_set_result(drcontext, -EPERM);
-            }
+                    (orig[11] == '\0' || orig[11] == '/'))
+                set_errno_result(drcontext, ENOENT);
+            else
+                set_errno_result(drcontext, EPERM);
             return false;
         }
 
-        /* remap into sandbox root */
+        bool should_redirect = g_redirect_tmp && open_flags_write_intent(flags) &&
+                               path_is_private_write_candidate(orig);
+        if (!should_redirect) {
+            if (g_mode == MODE_OBSERVE)
+                LOG("OBSERVE open: %s flags=0x%x", orig, flags);
+            return true;
+        }
+
         char remapped[512];
         if (!remap_path(orig, remapped, sizeof(remapped))) {
-            dr_syscall_set_result(drcontext, -EPERM);
+            set_errno_result(drcontext, EPERM);
             return false;
         }
-        LOG("REMAP open: %s -> %s", orig, remapped);
+        LOG("REMAP private-write open: %s -> %s flags=0x%x", orig, remapped, flags);
 
-        /* write remapped string back into app memory in-place if it fits,
-         * otherwise just log and allow the remapped path.
-         * DynamoRIO doesn't give us a good way to allocate new strings in the
-         * app address space portably, so we use dr_write_memory. */
         if (strlen(remapped) <= strlen(orig)) {
-            /* fits: overwrite in place */
-            dr_safe_write((void *)(uintptr_t)path_arg, strlen(remapped) + 1,
-                          remapped, NULL);
+            if (!dr_safe_write((void *)(uintptr_t)path_arg, strlen(remapped) + 1,
+                               remapped, NULL)) {
+                set_errno_result(drcontext, EFAULT);
+                return false;
+            }
         } else {
-            /* allocate a new page via DynamoRIO heap and patch the register */
             void *newbuf = dr_global_alloc(512);
             if (newbuf) {
                 memcpy(newbuf, remapped, strlen(remapped) + 1);
@@ -628,12 +714,20 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
                     dr_syscall_set_param(drcontext, 1, (reg_t)(uintptr_t)newbuf);
                 else
                     dr_syscall_set_param(drcontext, 0, (reg_t)(uintptr_t)newbuf);
-                /* Note: we intentionally leak this; it's a prototype */
             } else {
-                dr_syscall_set_result(drcontext, -ENOMEM);
+                set_errno_result(drcontext, ENOMEM);
                 return false;
             }
         }
+        return true;
+    }
+
+    /* Observe mode is the compatibility-first mode for Wolfram/LF-style
+     * Docker probes: after selected path virtualization above, pass every other
+     * syscall through while logging enough to build an enforce profile later.
+     */
+    if (g_mode == MODE_OBSERVE) {
+        LOG("OBSERVE syscall %d", sysnum);
         return true;
     }
 
@@ -642,7 +736,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         reg_t fd = dr_syscall_get_param(drcontext, 0);
         if (fd != 1 && fd != 2) {
             LOG("BLOCK write: fd=%ld", (long)fd);
-            dr_syscall_set_result(drcontext, -EPERM);
+            set_errno_result(drcontext, EPERM);
             return false;
         }
         return true;
@@ -663,7 +757,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         reg_t prot = dr_syscall_get_param(drcontext, 2);
         if (prot & PROT_EXEC) {
             LOG("WARN mmap PROT_EXEC requested (prot=0x%lx) - BLOCKED", (long)prot);
-            dr_syscall_set_result(drcontext, -EPERM);
+            set_errno_result(drcontext, EPERM);
             return false;
         }
         return true;
@@ -674,7 +768,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         reg_t prot = dr_syscall_get_param(drcontext, 2);
         if (prot & PROT_EXEC) {
             LOG("WARN mprotect PROT_EXEC requested (prot=0x%lx) - BLOCKED", (long)prot);
-            dr_syscall_set_result(drcontext, -EPERM);
+            set_errno_result(drcontext, EPERM);
             return false;
         }
         return true;
@@ -701,14 +795,14 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         case SYS_setsockopt:
         case SYS_getsockopt:
             LOG("BLOCK network syscall %d", sysnum);
-            dr_syscall_set_result(drcontext, -ENETDOWN);
+            set_errno_result(drcontext, ENETDOWN);
             return false;
     }
 
     /* --- execve / execveat ----------------------------------- */
     if (sysnum == SYS_execve || sysnum == SYS_execveat) {
         LOG("BLOCK execve");
-        dr_syscall_set_result(drcontext, -EPERM);
+        set_errno_result(drcontext, EPERM);
         return false;
     }
 
@@ -719,7 +813,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         dr_mutex_unlock(g_mutex);
         if (cnt > MAX_PROCS) {
             LOG("BLOCK fork: proc limit %d exceeded", MAX_PROCS);
-            dr_syscall_set_result(drcontext, -EAGAIN);
+            set_errno_result(drcontext, EAGAIN);
             return false;
         }
         LOG("ALLOW fork (%d/%d)", cnt, MAX_PROCS);
@@ -736,7 +830,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             dr_mutex_unlock(g_mutex);
             if (cnt > MAX_PROCS) {
                 LOG("BLOCK clone(new-proc): proc limit %d exceeded", MAX_PROCS);
-                dr_syscall_set_result(drcontext, -EAGAIN);
+                set_errno_result(drcontext, EAGAIN);
                 return false;
             }
             LOG("ALLOW clone(new-proc) (%d/%d)", cnt, MAX_PROCS);
@@ -746,13 +840,16 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
 
     /* ── BLOCKED (everything else) ───────────────────────────── */
     LOG("BLOCK syscall %d", sysnum);
-    dr_syscall_set_result(drcontext, -EPERM);
+    set_errno_result(drcontext, EPERM);
     return false;
 }
 
 /* ── client init ─────────────────────────────────────────────── */
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
+    (void)id;
+    (void)argc;
+    (void)argv;
     dr_set_client_name("syscall-virtualization-filter",
                        "https://github.com/example/shimmy");
 
@@ -771,16 +868,26 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_snprintf(g_sandbox_root, sizeof(g_sandbox_root),
                 "%s%s/", SANDBOX_BASE, g_session_id);
 
-    /* create sandbox directory */
-    if (!dr_create_dir(SANDBOX_BASE))
-        ; /* may already exist */
-    if (!dr_create_dir(g_sandbox_root))
-        ; /* may already exist */
+    const char *env_mode = getenv("DR_SANDBOX_MODE");
+    if (env_mode && (strcmp(env_mode, "strict") == 0 || strcmp(env_mode, "enforce") == 0))
+        g_mode = MODE_STRICT;
+    else
+        g_mode = MODE_OBSERVE;
+
+    const char *env_redirect_tmp = getenv("DR_REDIRECT_TMP");
+    if (env_redirect_tmp &&
+        (strcmp(env_redirect_tmp, "0") == 0 || strcmp(env_redirect_tmp, "false") == 0 ||
+         strcmp(env_redirect_tmp, "no") == 0))
+        g_redirect_tmp = false;
+
+    ensure_private_dirs();
 
     g_mutex = dr_mutex_create();
 
     dr_register_filter_syscall_event(event_filter_syscall);
     dr_register_pre_syscall_event(event_pre_syscall);
 
-    LOG("syscall virtualization active - sandbox: %s", g_sandbox_root);
+    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s",
+        g_sandbox_root, g_mode == MODE_STRICT ? "strict" : "observe",
+        g_redirect_tmp ? "true" : "false");
 }

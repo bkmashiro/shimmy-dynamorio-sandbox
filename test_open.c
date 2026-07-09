@@ -18,10 +18,11 @@ int main(void)
     if (fd < 0) {
         if (errno == EPERM) {
             printf("test_open: open() returned EPERM (errno=1) - correctly blocked!\n");
+            return 0;
         } else {
             printf("test_open: open() failed with errno=%d (%s)\n", errno, strerror(errno));
+            return 1;
         }
-        return 1;
     }
 
     printf("test_open: open() SUCCEEDED with fd=%d - NOT blocked (unexpected)\n", fd);
