@@ -10,7 +10,7 @@ Priority order:
 
 1. **Correct transparent execution** under DynamoRIO.
 2. **Observe mode** audit logs for filesystem/process/network behavior.
-3. **Disposable side effects** through per-run private scratch paths, starting with `/tmp`, `/var/tmp`, `$HOME/.Wolfram`, and cache paths.
+3. **Disposable side effects** through per-run private scratch paths, starting with ordinary `/tmp`, `/var/tmp`, `$HOME/.Wolfram`, and cache paths, while preserving shared rendezvous paths such as `/tmp/MathLink` and `/dev/shm`.
 4. Enforce/deny profiles only after traces show what a real runtime needs.
 5. Cold/warm timing only after correctness is stable; memory snapshot/restore is out of scope for now.
 
@@ -23,10 +23,12 @@ Priority order:
 
 `DR_REDIRECT_TMP=1` enables private path redirection for opens and common path syscalls (`mkdir`, `access`, `stat`, `rename`, `unlink`, `rmdir`, plus `*at` variants) under:
 
-- `/tmp`
+- ordinary `/tmp`
 - `/var/tmp`
 - paths containing `/.Wolfram`
 - paths containing `/.cache`
+
+`/tmp/MathLink` and `/dev/shm` are deliberately left pass-through in observe mode because the Wolfram evaluator uses them for MathLink/shared-memory rendezvous between child processes. Blanket-remapping them can break the evaluator before useful policy evidence is collected.
 
 The redirected path is under:
 
@@ -43,12 +45,13 @@ Local Docker Desktop on Apple Silicon is useful for building the image but **not
 Verified on AWS CodeBuild native x86_64 Linux:
 
 ```text
-BUILD_ID=shimmy-dynamorio-docker-smoke:8ebbb0aa-1812-400c-894c-27a53b2e84a6
+BUILD_ID=shimmy-dynamorio-docker-smoke:fc9f0ac4-8f04-44e9-8c85-b20bf2166f08
 status=passed
 checks:
   - make docker-build
   - make smoke-private-tmp
   - make smoke-audit-jsonl
+  - make smoke-wolfram-path-policy
   - make smoke-dynamic-shell
   - make demo
 ```
@@ -68,6 +71,7 @@ The smoke asserted:
 - original `/tmp/shimmy-dr-vfs` did not exist after the run;
 - redirected `/tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs` was also removed after the private VFS lifecycle;
 - `DR_AUDIT_JSONL=1` produced parseable/remappable JSONL evidence (`audit jsonl ok 12`);
+- the Wolfram-style path policy smoke preserved `/tmp/MathLink` and `/dev/shm` while still remapping an ordinary `/tmp` file, and validated the separate `DR_AUDIT_PATH` JSONL file;
 - a real dynamic `/bin/bash` process ran under observe mode and produced a much larger audit trace (`dynamic shell ok 322`).
 
 Strict-mode legacy smoke also passed:

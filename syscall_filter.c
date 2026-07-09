@@ -348,34 +348,52 @@ static char           g_sandbox_root[256];   /* /tmp/dr-sandbox/<session-id>/ */
 static sandbox_mode_t g_mode = MODE_OBSERVE;
 static bool           g_redirect_tmp = true;
 static bool           g_audit_jsonl = false;
+static bool           g_human_log = true;
 static int            g_proc_count = 0;
 static void          *g_mutex;
 
-static file_t         g_log;                 /* DynamoRIO file handle for stderr */
+static file_t         g_log;                 /* human log handle, stderr by default */
+static file_t         g_audit_log;           /* JSONL audit handle, stderr unless DR_AUDIT_PATH is set */
 
 /* ── logging helper ──────────────────────────────────────────── */
-#define LOG(fmt, ...) \
-    dr_fprintf(g_log, "[dr-sandbox][%s] " fmt "\n", g_session_id, ##__VA_ARGS__)
+#define LOG(fmt, ...) do { \
+    if (g_human_log) \
+        dr_fprintf(g_log, "[dr-sandbox][%s] " fmt "\n", g_session_id, ##__VA_ARGS__); \
+} while (0)
 
-static void audit_json_string(const char *s)
+static void audit_append_raw(char **p, char *end, const char *s)
 {
-    dr_fprintf(g_log, "\"");
-    for (const unsigned char *p = (const unsigned char *)s; p && *p; p++) {
-        unsigned char c = *p;
+    while (*s && *p < end)
+        *(*p)++ = *s++;
+}
+
+static void audit_append_json_string(char **p, char *end, const char *s)
+{
+    if (*p < end) *(*p)++ = '"';
+    for (const unsigned char *q = (const unsigned char *)s; q && *q && *p < end; q++) {
+        unsigned char c = *q;
         switch (c) {
-            case '\\': dr_fprintf(g_log, "\\\\"); break;
-            case '"':  dr_fprintf(g_log, "\\\""); break;
-            case '\n': dr_fprintf(g_log, "\\n"); break;
-            case '\r': dr_fprintf(g_log, "\\r"); break;
-            case '\t': dr_fprintf(g_log, "\\t"); break;
+            case '\\': audit_append_raw(p, end, "\\\\"); break;
+            case '"':  audit_append_raw(p, end, "\\\""); break;
+            case '\n': audit_append_raw(p, end, "\\n"); break;
+            case '\r': audit_append_raw(p, end, "\\r"); break;
+            case '\t': audit_append_raw(p, end, "\\t"); break;
             default:
-                if (c < 0x20)
-                    dr_fprintf(g_log, "\\u%04x", c);
-                else
-                    dr_fprintf(g_log, "%c", c);
+                if (c < 0x20) {
+                    char esc[8];
+                    dr_snprintf(esc, sizeof(esc), "\\u%04x", c);
+                    audit_append_raw(p, end, esc);
+                } else {
+                    *(*p)++ = (char)c;
+                }
         }
     }
-    dr_fprintf(g_log, "\"");
+    if (*p < end) *(*p)++ = '"';
+}
+
+static void audit_write_line(const char *line)
+{
+    dr_write_file(g_audit_log, line, strlen(line));
 }
 
 static void audit_path_event(const char *action, int sysnum, const char *label,
@@ -383,30 +401,42 @@ static void audit_path_event(const char *action, int sysnum, const char *label,
 {
     if (!g_audit_jsonl)
         return;
-    dr_fprintf(g_log, "{\"type\":\"path\",\"session\":");
-    audit_json_string(g_session_id);
-    dr_fprintf(g_log, ",\"mode\":\"%s\",\"action\":", g_mode == MODE_STRICT ? "strict" : "observe");
-    audit_json_string(action);
-    dr_fprintf(g_log, ",\"syscall\":%d,\"label\":", sysnum);
-    audit_json_string(label);
-    dr_fprintf(g_log, ",\"path\":");
-    audit_json_string(path);
+    char line[2048];
+    char *p = line;
+    char *end = line + sizeof(line) - 2;
+    audit_append_raw(&p, end, "{\"type\":\"path\",\"session\":");
+    audit_append_json_string(&p, end, g_session_id);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"mode\":\"%s\",\"action\":",
+                     g_mode == MODE_STRICT ? "strict" : "observe");
+    audit_append_json_string(&p, end, action);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"syscall\":%d,\"label\":", sysnum);
+    audit_append_json_string(&p, end, label);
+    audit_append_raw(&p, end, ",\"path\":");
+    audit_append_json_string(&p, end, path);
     if (remapped && *remapped) {
-        dr_fprintf(g_log, ",\"remapped\":");
-        audit_json_string(remapped);
+        audit_append_raw(&p, end, ",\"remapped\":");
+        audit_append_json_string(&p, end, remapped);
     }
-    dr_fprintf(g_log, "}\n");
+    audit_append_raw(&p, end, "}\n");
+    *p = '\0';
+    audit_write_line(line);
 }
 
 static void audit_syscall_event(const char *action, int sysnum)
 {
     if (!g_audit_jsonl)
         return;
-    dr_fprintf(g_log, "{\"type\":\"syscall\",\"session\":");
-    audit_json_string(g_session_id);
-    dr_fprintf(g_log, ",\"mode\":\"%s\",\"action\":", g_mode == MODE_STRICT ? "strict" : "observe");
-    audit_json_string(action);
-    dr_fprintf(g_log, ",\"syscall\":%d}\n", sysnum);
+    char line[512];
+    char *p = line;
+    char *end = line + sizeof(line) - 2;
+    audit_append_raw(&p, end, "{\"type\":\"syscall\",\"session\":");
+    audit_append_json_string(&p, end, g_session_id);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"mode\":\"%s\",\"action\":",
+                     g_mode == MODE_STRICT ? "strict" : "observe");
+    audit_append_json_string(&p, end, action);
+    p += dr_snprintf(p, (size_t)(end - p), ",\"syscall\":%d}\n", sysnum);
+    *p = '\0';
+    audit_write_line(line);
 }
 
 /* ── path canonicalization: resolve ".." components in-place ─── */
@@ -619,6 +649,10 @@ static bool path_is_private_write_candidate(const char *path)
         memcpy(canonical, path, plen);
         canonical[plen] = '\0';
     }
+
+    if (path_has_prefix_component(canonical, "/tmp/MathLink") ||
+        path_has_prefix_component(canonical, "/dev/shm"))
+        return false;
 
     if (path_has_prefix_component(canonical, "/tmp") ||
         path_has_prefix_component(canonical, "/var/tmp"))
@@ -1019,6 +1053,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
                        "https://github.com/example/shimmy");
 
     g_log = STDERR;
+    g_audit_log = STDERR;
 
     /* read or generate session id */
     const char *env_sid = getenv("DR_SESSION_ID");
@@ -1051,9 +1086,27 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
         strcmp(env_audit_jsonl, "no") != 0)
         g_audit_jsonl = true;
 
+    const char *env_human_log = getenv("DR_HUMAN_LOG");
+    if (env_human_log &&
+        (strcmp(env_human_log, "0") == 0 || strcmp(env_human_log, "false") == 0 ||
+         strcmp(env_human_log, "no") == 0))
+        g_human_log = false;
+
     ensure_private_dirs();
 
     g_mutex = dr_mutex_create();
+
+    const char *env_audit_path = getenv("DR_AUDIT_PATH");
+    if (env_audit_path && *env_audit_path) {
+        file_t audit_file = dr_open_file(env_audit_path,
+                                         DR_FILE_WRITE_APPEND | DR_FILE_ALLOW_LARGE);
+        if (audit_file != INVALID_FILE) {
+            g_audit_log = audit_file;
+            g_audit_jsonl = true;
+        } else {
+            LOG("WARN could not open DR_AUDIT_PATH=%s; using stderr", env_audit_path);
+        }
+    }
 
     dr_register_filter_syscall_event(event_filter_syscall);
     dr_register_pre_syscall_event(event_pre_syscall);

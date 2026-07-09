@@ -11,6 +11,7 @@ phases:
       - make docker-build
       - make smoke-private-tmp
       - make smoke-audit-jsonl
+      - make smoke-wolfram-path-policy
       - make smoke-dynamic-shell
       - make demo
       - |
@@ -19,7 +20,7 @@ phases:
         out = {
             "status": "passed",
             "timestamp": int(time.time()),
-            "checks": ["make docker-build", "make smoke-private-tmp", "make smoke-audit-jsonl", "make smoke-dynamic-shell", "make demo"],
+            "checks": ["make docker-build", "make smoke-private-tmp", "make smoke-audit-jsonl", "make smoke-wolfram-path-policy", "make smoke-dynamic-shell", "make demo"],
             "note": "Executed on CodeBuild native x86_64 Linux; Apple Silicon Docker Desktop amd64 emulation is not a valid DynamoRIO runtime gate.",
         }
         p = pathlib.Path('/tmp/dynamorio-codebuild-smoke-result.json')

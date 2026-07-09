@@ -24,7 +24,7 @@ MAX_PROCS      ?= 5
 DR_MODE        ?= observe
 DR_REDIRECT_TMP ?= 1
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy clean
 
 all: client test-prog
 
@@ -108,6 +108,20 @@ smoke-audit-jsonl: docker-build
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    bash -lc 'rm -rf /tmp/shimmy-dr-vfs /tmp/dr-sandbox/audit-smoke/tmp/shimmy-dr-vfs; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_tmp_write 2>/tmp/audit.log; grep -q "^{\"type\":\"path\"" /tmp/audit.log; grep -q "\"action\":\"remap\"" /tmp/audit.log; grep -q "\"path\":\"/tmp/shimmy-dr-vfs\"" /tmp/audit.log; grep -q "\"path\":\"/tmp/shimmy-dr-vfs/side-effect.txt\"" /tmp/audit.log; grep -q "\"remapped\":\"/tmp/dr-sandbox/audit-smoke/" /tmp/audit.log; echo audit jsonl ok $$(grep -c "^{" /tmp/audit.log)'
+
+# Wolfram-style path policy smoke: MathLink and shared-memory rendezvous paths
+# must stay shared/pass-through, while ordinary /tmp writes remain private.
+smoke-wolfram-path-policy: docker-build
+	docker run --rm \
+	    -e DR_SESSION_ID=wolfram-path \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_REDIRECT_TMP=1 \
+	    -e DR_AUDIT_JSONL=1 \
+	    -e DR_AUDIT_PATH=/tmp/dr-audit.jsonl \
+	    -e DR_HUMAN_LOG=0 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -lc 'rm -rf /tmp/shimmy-dr-normal /tmp/MathLink /tmp/dr-sandbox/wolfram-path /tmp/dr-audit.jsonl; mkdir -p /tmp/MathLink; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /bin/bash -lc "printf normal >/tmp/shimmy-dr-normal && printf link >/tmp/MathLink/ml-test.rec && printf shm >/dev/shm/shimmy-dr-shm-test"; test ! -e /tmp/shimmy-dr-normal; test -f /tmp/MathLink/ml-test.rec; test -f /dev/shm/shimmy-dr-shm-test; grep -q "\"path\":\"/tmp/shimmy-dr-normal\"" /tmp/dr-audit.jsonl; grep -q "\"remapped\":\"/tmp/dr-sandbox/wolfram-path/tmp/shimmy-dr-normal\"" /tmp/dr-audit.jsonl; grep -q "\"path\":\"/tmp/MathLink/ml-test.rec\"" /tmp/dr-audit.jsonl; ! grep -q "\"remapped\":\"/tmp/dr-sandbox/wolfram-path/tmp/MathLink" /tmp/dr-audit.jsonl; grep -q "\"path\":\"/dev/shm/shimmy-dr-shm-test\"" /tmp/dr-audit.jsonl; ! grep -q "\"remapped\":\"/tmp/dr-sandbox/wolfram-path/dev/shm" /tmp/dr-audit.jsonl; python3 -c "import json; [json.loads(line) for line in open(\"/tmp/dr-audit.jsonl\")]"; rm -f /tmp/MathLink/ml-test.rec /dev/shm/shimmy-dr-shm-test; echo wolfram path policy ok $$(wc -l </tmp/dr-audit.jsonl)'
 
 # Dynamic-loader smoke: run a real dynamic /bin/bash process under observe mode.
 smoke-dynamic-shell: docker-build
