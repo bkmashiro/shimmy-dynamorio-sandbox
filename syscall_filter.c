@@ -363,6 +363,10 @@ static bool           g_redirect_tmp = true;
 static bool           g_audit_jsonl = false;
 static bool           g_human_log = true;
 static size_t         g_max_read_bytes = MAX_READ_BYTES;
+static size_t         g_max_alloc_bytes = 0; /* 0 = unlimited; DR-only mmap/brk budget */
+static size_t         g_alloc_bytes = 0;
+static reg_t          g_initial_brk = 0;
+static reg_t          g_current_brk = 0;
 static int            g_max_procs = MAX_PROCS;
 static bool           g_block_network = false;
 static bool           g_block_exec = false;
@@ -372,6 +376,11 @@ static int            g_proc_count = 0;
 static void          *g_mutex;
 static path_policy_rule_t g_path_rules[32];
 static int            g_path_rule_count = 0;
+static int            g_last_sysnum;
+static size_t         g_last_mmap_len;
+static size_t         g_last_mremap_old_len;
+static size_t         g_last_mremap_new_len;
+static size_t         g_last_munmap_len;
 
 static file_t         g_log;                 /* human log handle, stderr by default */
 static file_t         g_audit_log;           /* JSONL audit handle, stderr unless DR_AUDIT_PATH is set */
@@ -507,6 +516,40 @@ static int parse_int_env(const char *value, int fallback)
     if (endp == value || n < 1 || n > 100000)
         return fallback;
     return (int)n;
+}
+
+static bool alloc_budget_enabled(void)
+{
+    return g_max_alloc_bytes > 0;
+}
+
+static bool alloc_budget_has_room(size_t bytes)
+{
+    return !alloc_budget_enabled() || bytes <= g_max_alloc_bytes - g_alloc_bytes;
+}
+
+static void alloc_budget_add(size_t bytes)
+{
+    if (!alloc_budget_enabled() || bytes == 0)
+        return;
+    dr_mutex_lock(g_mutex);
+    if (bytes > g_max_alloc_bytes - g_alloc_bytes)
+        g_alloc_bytes = g_max_alloc_bytes;
+    else
+        g_alloc_bytes += bytes;
+    dr_mutex_unlock(g_mutex);
+}
+
+static void alloc_budget_sub(size_t bytes)
+{
+    if (!alloc_budget_enabled() || bytes == 0)
+        return;
+    dr_mutex_lock(g_mutex);
+    if (bytes > g_alloc_bytes)
+        g_alloc_bytes = 0;
+    else
+        g_alloc_bytes -= bytes;
+    dr_mutex_unlock(g_mutex);
 }
 
 /* ── path canonicalization: resolve ".." components in-place ─── */
@@ -938,6 +981,12 @@ static bool event_filter_syscall(void *drcontext, int sysnum)
 
 static bool event_pre_syscall(void *drcontext, int sysnum)
 {
+    g_last_sysnum = sysnum;
+    g_last_mmap_len = 0;
+    g_last_mremap_old_len = 0;
+    g_last_mremap_new_len = 0;
+    g_last_munmap_len = 0;
+
     /* ── ALWAYS ALLOWED ──────────────────────────────────────── */
     switch (sysnum) {
         /* core I/O on already-open fds */
@@ -954,10 +1003,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         case SYS_getdents64:
         case SYS_dup3:
         case SYS_pipe2:
-        /* memory management (no PROT_EXEC check here – see mmap/mprotect below) */
-        case SYS_brk:
-        case SYS_munmap:
-        case SYS_mremap:
+        /* memory management checks are below so DR can own Lambda-compatible limits */
         case SYS_msync:
         /* signal handling */
         case SYS_rt_sigaction:
@@ -1167,7 +1213,48 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
         return true;
     }
 
+    if (sysnum == SYS_brk) {
+        reg_t requested = dr_syscall_get_param(drcontext, 0);
+        if (requested == 0)
+            return true; /* learn current break in post-syscall */
+        if (alloc_budget_enabled() && g_initial_brk != 0 && requested > g_initial_brk) {
+            size_t requested_heap = (size_t)(requested - g_initial_brk);
+            if (requested_heap > g_max_alloc_bytes) {
+                LOG("BLOCK brk: requested heap %llu > max_alloc %llu",
+                    (unsigned long long)requested_heap,
+                    (unsigned long long)g_max_alloc_bytes);
+                audit_syscall_event("block", sysnum);
+                set_errno_result(drcontext, ENOMEM);
+                return false;
+            }
+        }
+        return true;
+    }
+
+    if (sysnum == SYS_munmap) {
+        g_last_munmap_len = (size_t)dr_syscall_get_param(drcontext, 1);
+        return true;
+    }
+
+    if (sysnum == SYS_mremap) {
+        size_t old_len = (size_t)dr_syscall_get_param(drcontext, 1);
+        size_t new_len = (size_t)dr_syscall_get_param(drcontext, 2);
+        g_last_mremap_old_len = old_len;
+        g_last_mremap_new_len = new_len;
+        if (new_len > old_len && !alloc_budget_has_room(new_len - old_len)) {
+            LOG("BLOCK mremap: grow %llu exceeds max_alloc %llu (used %llu)",
+                (unsigned long long)(new_len - old_len),
+                (unsigned long long)g_max_alloc_bytes,
+                (unsigned long long)g_alloc_bytes);
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, ENOMEM);
+            return false;
+        }
+        return true;
+    }
+
     if (sysnum == SYS_mmap) {
+        reg_t len = dr_syscall_get_param(drcontext, 1);
         reg_t prot = dr_syscall_get_param(drcontext, 2);
         if (g_block_prot_exec && (prot & PROT_EXEC)) {
             LOG("WARN mmap PROT_EXEC requested (prot=0x%lx) - BLOCKED", (long)prot);
@@ -1175,6 +1262,16 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             set_errno_result(drcontext, EPERM);
             return false;
         }
+        if (!alloc_budget_has_room((size_t)len)) {
+            LOG("BLOCK mmap: len %llu exceeds max_alloc %llu (used %llu)",
+                (unsigned long long)len,
+                (unsigned long long)g_max_alloc_bytes,
+                (unsigned long long)g_alloc_bytes);
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, ENOMEM);
+            return false;
+        }
+        g_last_mmap_len = (size_t)len;
         return true;
     }
 
@@ -1382,6 +1479,53 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
     return false;
 }
 
+static void event_post_syscall(void *drcontext, int sysnum)
+{
+    dr_syscall_result_info_t info;
+    memset(&info, 0, sizeof(info));
+    info.size = sizeof(info);
+    info.use_errno = true;
+    if (!dr_syscall_get_result_ex(drcontext, &info))
+        return;
+    reg_t result = info.value;
+
+    if (sysnum == SYS_mmap) {
+        if (g_last_sysnum == SYS_mmap && g_last_mmap_len > 0 && info.succeeded)
+            alloc_budget_add(g_last_mmap_len);
+        return;
+    }
+
+    if (sysnum == SYS_munmap) {
+        if (g_last_sysnum == SYS_munmap && g_last_munmap_len > 0 && info.succeeded)
+            alloc_budget_sub(g_last_munmap_len);
+        return;
+    }
+
+    if (sysnum == SYS_mremap) {
+        if (g_last_sysnum == SYS_mremap && info.succeeded) {
+            if (g_last_mremap_new_len > g_last_mremap_old_len)
+                alloc_budget_add(g_last_mremap_new_len - g_last_mremap_old_len);
+            else
+                alloc_budget_sub(g_last_mremap_old_len - g_last_mremap_new_len);
+        }
+        return;
+    }
+
+    if (sysnum == SYS_brk) {
+        reg_t requested = dr_syscall_get_param(drcontext, 0);
+        if (info.succeeded && result != 0) {
+            if (g_initial_brk == 0)
+                g_initial_brk = result;
+            g_current_brk = result;
+        }
+        if (requested != 0 && result == requested && g_initial_brk != 0 && result > g_initial_brk) {
+            size_t heap_bytes = (size_t)(result - g_initial_brk);
+            if (heap_bytes > g_alloc_bytes)
+                g_alloc_bytes = heap_bytes;
+        }
+    }
+}
+
 /* ── client init ─────────────────────────────────────────────── */
 DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
 {
@@ -1422,6 +1566,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
     g_block_prot_exec = g_mode == MODE_STRICT;
     g_stdio_only_writes = g_mode == MODE_STRICT;
     g_max_read_bytes = parse_size_env(getenv("DR_MAX_READ_BYTES"), MAX_READ_BYTES);
+    g_max_alloc_bytes = parse_size_env(getenv("DR_MAX_ALLOC_BYTES"), 0);
     g_max_procs = parse_int_env(getenv("DR_MAX_PROCS"), MAX_PROCS);
     g_block_network = env_policy_blocks(getenv("DR_NETWORK"), g_block_network);
     g_block_exec = env_policy_blocks(getenv("DR_EXEC"), g_block_exec);
@@ -1461,12 +1606,14 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
 
     dr_register_filter_syscall_event(event_filter_syscall);
     dr_register_pre_syscall_event(event_pre_syscall);
+    dr_register_post_syscall_event(event_post_syscall);
 
-    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s audit_jsonl=%s path_rules=%d net=%s exec=%s prot_exec=%s file_write=%s max_read=%llu max_procs=%d",
+    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s audit_jsonl=%s path_rules=%d net=%s exec=%s prot_exec=%s file_write=%s max_read=%llu max_procs=%d max_alloc=%llu",
         g_sandbox_root, g_mode == MODE_STRICT ? "strict" : "observe",
         g_redirect_tmp ? "true" : "false", g_audit_jsonl ? "true" : "false",
         g_path_rule_count,
         g_block_network ? "block" : "allow", g_block_exec ? "block" : "allow",
         g_block_prot_exec ? "block" : "allow", g_stdio_only_writes ? "stdio" : "allow",
-        (unsigned long long)g_max_read_bytes, g_max_procs);
+        (unsigned long long)g_max_read_bytes, g_max_procs,
+        (unsigned long long)g_max_alloc_bytes);
 }

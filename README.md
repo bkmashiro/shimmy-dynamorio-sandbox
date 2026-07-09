@@ -2,9 +2,9 @@
 
 A prototype sandbox using [DynamoRIO](https://dynamorio.org/) for **syscall virtualization** — not just allow/block, but intercepting syscalls and replacing them with safe, controlled behavior.
 
-## Current Docker-first Wolfram direction
+## Current Lambda-compatible DR-only direction
 
-For Wolfram/LambdaFeedback-style work, use Docker/regular container runtime as the primary target. AWS Lambda is only a side/negative target unless the explicit goal is a Wolfram-on-Lambda port.
+Sandbox policy must live inside the DynamoRIO client. Docker, CodeBuild, and Lambda containers are only launch/build carriers: do not rely on Docker-only controls such as `--network=none`, `--memory`, or `--pids-limit` for correctness, because those controls are not available in the same form inside AWS Lambda.
 
 This prototype now supports two runtime modes:
 
@@ -22,17 +22,18 @@ This prototype now supports two runtime modes:
 | `DR_PROT_EXEC=allow|block` | Override executable memory (`mmap`/`mprotect` with `PROT_EXEC`). Strict defaults to `block`; observe defaults to `allow`. |
 | `DR_FILE_WRITE=allow|block` | Override fd-write policy. `block` means only stdout/stderr writes are allowed; strict defaults to this. |
 | `DR_MAX_READ_BYTES=1m` | Cap bytes per `read`/`pread64` syscall; default is `1 MiB`. |
-| `DR_MAX_PROCS=5` | In-client fork/clone process limit; pair with Docker `--pids-limit` for kernel-level enforcement. |
+| `DR_MAX_ALLOC_BYTES=128m` | DR-only allocation budget for app `mmap`/`mremap` growth plus learned `brk` heap growth. `0`/unset means unlimited. This is a userspace compatibility guard, not a kernel cgroup limit. |
+| `DR_MAX_PROCS=5` | In-client fork/clone process limit. Do not depend on Docker `--pids-limit`; Lambda-compatible policy must be enforced here. |
 
 Use observe mode first, then derive a narrower enforce profile from logs. Do not start by blocking everything: Wolfram may legitimately write license/cache/paclet/temp files.
 
-See `docker-first-wolfram-dynamorio-roadmap-20260709.md` for the current scope and verified CodeBuild smoke.
+Use native x86_64 CodeBuild/Lambda-style probes as the runtime gate. Local Docker on Apple Silicon is useful for image/build checks, but amd64-on-arm64 emulation is not a valid DynamoRIO runtime gate.
 
 ## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Docker container  (--network=none, --cap-drop ALL) │
+│  Lambda/container process (carrier only)             │
 │                                                     │
 │  drrun  ──── JIT recompiles app ────────────────┐   │
 │              inserting pre-syscall hooks         │   │
@@ -74,7 +75,8 @@ DynamoRIO operates **entirely in userspace** via JIT code rewriting — no `ptra
 | `read`, `pread64` | Allowed but capped at **1 MiB per call** | Prevents I/O amplification and DoS via huge reads |
 | `socket`, `connect`, `bind`, `listen`, … | Return `-ENETDOWN` | No network access; isolation from C2, exfiltration |
 | `execve`, `execveat` | Return `-EPERM` | No exec chain; sandbox cannot spawn unsandboxed children |
-| `fork`, `vfork`, `clone` (new process) | Counted; return `-EAGAIN` after **5 processes** | Prevents fork bombs and resource exhaustion |
+| `fork`, `vfork`, `clone` (new process) | Counted in-client; return `-EAGAIN` after configured limit | Prevents fork bombs and resource exhaustion without Docker pids limits |
+| `mmap` / `mremap` / `munmap` / `brk` growth | Optional `DR_MAX_ALLOC_BYTES` userspace allocation budget; excessive growth returns `-ENOMEM` | Lambda-compatible guardrail when cgroups are not controlled by us |
 | `mmap(PROT_EXEC)` | Return `-EPERM` | Blocks JIT compilers and shellcode injection |
 | `mprotect(PROT_EXEC)` | Return `-EPERM` | Blocks RWX page tricks used in exploitation |
 
@@ -147,8 +149,8 @@ dynamorio-sandbox [flags]
   --exec      string    Program to run (required)
   --args      string    Space-separated arguments
   --timeout   duration  Max execution time (default 30s)
-  --max-mem   string    Memory limit (default 256m)
-  --max-procs int       Docker pids-limit (default 5)
+  --max-mem   string    DR allocation budget / DR_MAX_ALLOC_BYTES, e.g. 256m (default unlimited)
+  --max-procs int       DR process limit / DR_MAX_PROCS (default client value)
   --mode      string    DR mode: observe or strict (default observe)
   --path-policy string  DR_PATH_POLICY rules, e.g. ro:/data;private:/tmp/work;block:/secrets
   --network-policy string    Network policy override: allow or block
@@ -156,7 +158,7 @@ dynamorio-sandbox [flags]
   --prot-exec-policy string  Executable-memory policy override: allow or block
   --file-write-policy string fd write policy override: allow or block/stdio
   --max-read-bytes string    Per-read cap, e.g. 1m or 4096
-  --dr-max-procs int         In-client fork/clone limit
+  --dr-max-procs int         Alias for --max-procs / DR_MAX_PROCS
   --image     string    Docker image (default dynamorio-sandbox)
   --session   string    Session ID (auto-generated)
   --dry-run             Print docker command, don't run

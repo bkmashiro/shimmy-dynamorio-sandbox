@@ -19,8 +19,6 @@ SESSION_ID     ?= $(shell cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "
 EXEC           ?= /bin/echo
 EXEC_ARGS      ?= hello from sandbox
 TIMEOUT        ?= 30
-MAX_MEM        ?= 256m
-MAX_PROCS      ?= 5
 DR_MODE        ?= observe
 DR_REDIRECT_TMP ?= 1
 DR_PATH_POLICY ?=
@@ -29,6 +27,7 @@ DR_EXEC        ?=
 DR_PROT_EXEC   ?=
 DR_FILE_WRITE  ?=
 DR_MAX_READ_BYTES ?=
+DR_MAX_ALLOC_BYTES ?=
 DR_MAX_PROCS   ?=
 
 .PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config clean
@@ -76,9 +75,8 @@ docker-run:
 	    -e DR_PROT_EXEC='$(DR_PROT_EXEC)' \
 	    -e DR_FILE_WRITE='$(DR_FILE_WRITE)' \
 	    -e DR_MAX_READ_BYTES='$(DR_MAX_READ_BYTES)' \
+	    -e DR_MAX_ALLOC_BYTES='$(DR_MAX_ALLOC_BYTES)' \
 	    -e DR_MAX_PROCS='$(DR_MAX_PROCS)' \
-	    --memory=$(MAX_MEM) \
-	    --pids-limit=$(MAX_PROCS) \
 	    --security-opt seccomp=unconfined \
 	    --cap-drop ALL \
 	    $(IMAGE_NAME) \
@@ -167,7 +165,8 @@ smoke-policy-config: docker-build
 	    bash -euo pipefail -lc 'rm -rf /tmp/dr-ro /tmp/dr-rw /tmp/dr-private /tmp/dr-block /tmp/dr-sandbox/policy-config /tmp/dr-policy-audit.jsonl; mkdir -p /tmp/dr-ro /tmp/dr-rw /tmp/dr-private /tmp/dr-block; printf readable >/tmp/dr-ro/input.txt; printf secret >/tmp/dr-block/input.txt; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /bin/bash -lc "grep -q readable /tmp/dr-ro/input.txt && ! printf nope >/tmp/dr-ro/out.txt && printf shared >/tmp/dr-rw/out.txt && printf private >/tmp/dr-private/out.txt && ! cat /tmp/dr-block/input.txt >/dev/null"; grep -q shared /tmp/dr-rw/out.txt; test ! -e /tmp/dr-private/out.txt; grep -q private /tmp/dr-sandbox/policy-config/tmp/dr-private/out.txt; grep -q "\"action\":\"readonly\"" /tmp/dr-policy-audit.jsonl; grep -q "\"action\":\"block\"" /tmp/dr-policy-audit.jsonl; grep -q "\"action\":\"remap\"" /tmp/dr-policy-audit.jsonl; echo policy config ok $$(wc -l </tmp/dr-policy-audit.jsonl)'
 
 # Runtime-control smoke: configurable traditional-sandbox style knobs for read
-# caps, network syscalls, and executable memory work in observe mode too.
+# caps, network syscalls, executable memory, and memory allocation work in
+# observe mode too. These are DR controls, not Docker/kernel resource limits.
 smoke-runtime-config: docker-build
 	docker run --rm \
 	    -e DR_SESSION_ID=runtime-config-read \
@@ -191,6 +190,13 @@ smoke-runtime-config: docker-build
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls prot_exec
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-alloc \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_MAX_ALLOC_BYTES=1m \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls mmap_alloc
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 

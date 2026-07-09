@@ -39,8 +39,8 @@ func main() {
 	execFlag := flag.String("exec", "", "Program to execute inside the sandbox (required)")
 	argsFlag := flag.String("args", "", "Space-separated arguments for the program")
 	timeoutFlag := flag.Duration("timeout", 30*time.Second, "Maximum execution time (e.g. 30s, 2m)")
-	memFlag := flag.String("max-mem", "256m", "Container memory limit (e.g. 128m, 1g)")
-	procsFlag := flag.Int("max-procs", 5, "Maximum number of processes (--pids-limit)")
+	memFlag := flag.String("max-mem", "", "DR allocation budget via DR_MAX_ALLOC_BYTES (e.g. 128m, 1g); empty = unlimited")
+	procsFlag := flag.Int("max-procs", 0, "DR process limit via DR_MAX_PROCS; 0 = client default")
 	imageFlag := flag.String("image", defaultImage, "Docker image to use")
 	dryRunFlag := flag.Bool("dry-run", false, "Print docker command without executing")
 	sessionFlag := flag.String("session", "", "Session ID (auto-generated if empty)")
@@ -52,7 +52,7 @@ func main() {
 	protExecFlag := flag.String("prot-exec-policy", "", "Executable-memory policy override: allow or block")
 	fileWriteFlag := flag.String("file-write-policy", "", "File-write policy override: allow or block/stdio")
 	maxReadBytesFlag := flag.String("max-read-bytes", "", "Per-read cap passed to DR_MAX_READ_BYTES, e.g. 1m or 4096")
-	drMaxProcsFlag := flag.Int("dr-max-procs", 0, "In-client process limit passed to DR_MAX_PROCS; defaults to the Docker pids limit")
+	drMaxProcsFlag := flag.Int("dr-max-procs", 0, "Alias for --max-procs; passed to DR_MAX_PROCS")
 	flag.Parse()
 
 	if *execFlag == "" {
@@ -76,9 +76,6 @@ func main() {
 	// Build docker run command
 	dockerArgs := []string{
 		"run", "--rm",
-		"--network=none",
-		fmt.Sprintf("--memory=%s", *memFlag),
-		fmt.Sprintf("--pids-limit=%d", *procsFlag),
 		"--security-opt", "seccomp=unconfined",
 		"--cap-drop", "ALL",
 		"-e", fmt.Sprintf("DR_SESSION_ID=%s", sessionID),
@@ -92,9 +89,14 @@ func main() {
 		{"DR_PROT_EXEC", *protExecFlag},
 		{"DR_FILE_WRITE", *fileWriteFlag},
 		{"DR_MAX_READ_BYTES", *maxReadBytesFlag},
+		{"DR_MAX_ALLOC_BYTES", *memFlag},
 	}
-	if *drMaxProcsFlag > 0 {
-		optionalEnv = append(optionalEnv, [2]string{"DR_MAX_PROCS", fmt.Sprintf("%d", *drMaxProcsFlag)})
+	drProcLimit := *drMaxProcsFlag
+	if drProcLimit <= 0 {
+		drProcLimit = *procsFlag
+	}
+	if drProcLimit > 0 {
+		optionalEnv = append(optionalEnv, [2]string{"DR_MAX_PROCS", fmt.Sprintf("%d", drProcLimit)})
 	}
 	for _, item := range optionalEnv {
 		if item[1] != "" {

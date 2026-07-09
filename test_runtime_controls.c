@@ -53,14 +53,29 @@ static int expect_prot_exec_block(void) {
     return 1;
 }
 
+static int expect_mmap_alloc_block(void) {
+    size_t len = 2 * 1024 * 1024;
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int saved = errno;
+    if (p == MAP_FAILED && saved == ENOMEM) {
+        puts("mmap alloc block ok");
+        return 0;
+    }
+    if (p != MAP_FAILED)
+        munmap(p, len);
+    fprintf(stderr, "mmap alloc block failed: p=%p errno=%d (%s)\n", p, saved, strerror(saved));
+    return 1;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2) {
-        fprintf(stderr, "usage: %s readcap|socket|prot_exec\n", argv[0]);
+        fprintf(stderr, "usage: %s readcap|socket|prot_exec|mmap_alloc\n", argv[0]);
         return 2;
     }
     if (strcmp(argv[1], "readcap") == 0) return expect_read_cap();
     if (strcmp(argv[1], "socket") == 0) return expect_socket_block();
     if (strcmp(argv[1], "prot_exec") == 0) return expect_prot_exec_block();
+    if (strcmp(argv[1], "mmap_alloc") == 0) return expect_mmap_alloc_block();
     fprintf(stderr, "unknown mode: %s\n", argv[1]);
     return 2;
 }
