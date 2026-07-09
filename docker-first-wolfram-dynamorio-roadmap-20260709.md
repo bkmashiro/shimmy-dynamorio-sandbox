@@ -21,7 +21,7 @@ Priority order:
 - `DR_SANDBOX_MODE=observe` — compatibility-first mode. It logs syscalls, passes most calls through, and can redirect selected private writable paths.
 - `DR_SANDBOX_MODE=strict` / `enforce` — original deny-by-default prototype behavior.
 
-`DR_REDIRECT_TMP=1` enables private write redirection for write/create opens under:
+`DR_REDIRECT_TMP=1` enables private path redirection for opens and common path syscalls (`mkdir`, `access`, `stat`, `rename`, `unlink`, `rmdir`, plus `*at` variants) under:
 
 - `/tmp`
 - `/var/tmp`
@@ -43,7 +43,7 @@ Local Docker Desktop on Apple Silicon is useful for building the image but **not
 Verified on AWS CodeBuild native x86_64 Linux:
 
 ```text
-BUILD_ID=shimmy-dynamorio-docker-smoke:f0af72ac-1801-4c2c-8ab3-f3803cde4932
+BUILD_ID=shimmy-dynamorio-docker-smoke:75ab9ffa-f7ac-4fd0-8ae4-676567ee0906
 status=passed
 checks:
   - make docker-build

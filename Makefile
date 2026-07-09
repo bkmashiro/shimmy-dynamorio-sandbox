@@ -96,7 +96,7 @@ smoke-private-tmp: docker-build
 	    -e DR_REDIRECT_TMP=1 \
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
-	    bash -lc 'rm -f /tmp/shimmy-dr-tmp-side-effect.txt; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_tmp_write; test ! -e /tmp/shimmy-dr-tmp-side-effect.txt; test -f /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-tmp-side-effect.txt'
+	    bash -lc 'rm -rf /tmp/shimmy-dr-vfs /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_tmp_write; test ! -e /tmp/shimmy-dr-vfs; test ! -e /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs'
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 

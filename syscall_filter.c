@@ -474,6 +474,10 @@ static bool path_is_blocked(const char *path)
 }
 
 /* ── path remapping: rewrite path → sandbox root ─────────────── */
+static bool read_app_string(void *drcontext, reg_t ptr, char *buf, size_t bufsz);
+static bool path_is_private_write_candidate(const char *path);
+static void set_errno_result(void *drcontext, int err);
+
 static bool remap_path(const char *orig, char *out, size_t outsz)
 {
     /* strip leading slashes for joining */
@@ -482,6 +486,65 @@ static bool remap_path(const char *orig, char *out, size_t outsz)
 
     int n = dr_snprintf(out, outsz, "%s%s", g_sandbox_root, rel);
     return (n > 0 && (size_t)n < outsz);
+}
+
+static void ensure_parent_dirs(const char *path)
+{
+    char tmp[512];
+    size_t plen = strlen(path);
+    if (plen >= sizeof(tmp)) plen = sizeof(tmp) - 1;
+    memcpy(tmp, path, plen);
+    tmp[plen] = '\0';
+
+    size_t root_len = strlen(g_sandbox_root);
+    for (size_t i = root_len; tmp[i] != '\0'; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+            if (strlen(tmp) > root_len)
+                dr_create_dir(tmp);
+            tmp[i] = '/';
+        }
+    }
+}
+
+static bool remap_private_path_param(void *drcontext, int sysnum, int param_index,
+                                     const char *label, bool ensure_parent)
+{
+    reg_t path_arg = dr_syscall_get_param(drcontext, param_index);
+    char orig[512];
+    if (!read_app_string(drcontext, path_arg, orig, sizeof(orig))) {
+        set_errno_result(drcontext, EFAULT);
+        return false;
+    }
+
+    if (!g_redirect_tmp || !path_is_private_write_candidate(orig))
+        return true;
+
+    char remapped[512];
+    if (!remap_path(orig, remapped, sizeof(remapped))) {
+        set_errno_result(drcontext, EPERM);
+        return false;
+    }
+    if (ensure_parent)
+        ensure_parent_dirs(remapped);
+
+    LOG("REMAP %s syscall=%d param=%d: %s -> %s", label, sysnum, param_index, orig, remapped);
+    if (strlen(remapped) <= strlen(orig)) {
+        if (!dr_safe_write((void *)(uintptr_t)path_arg, strlen(remapped) + 1,
+                           remapped, NULL)) {
+            set_errno_result(drcontext, EFAULT);
+            return false;
+        }
+    } else {
+        void *newbuf = dr_global_alloc(512);
+        if (!newbuf) {
+            set_errno_result(drcontext, ENOMEM);
+            return false;
+        }
+        memcpy(newbuf, remapped, strlen(remapped) + 1);
+        dr_syscall_set_param(drcontext, param_index, (reg_t)(uintptr_t)newbuf);
+    }
+    return true;
 }
 
 static bool open_flags_write_intent(int flags)
@@ -685,8 +748,7 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             return false;
         }
 
-        bool should_redirect = g_redirect_tmp && open_flags_write_intent(flags) &&
-                               path_is_private_write_candidate(orig);
+        bool should_redirect = g_redirect_tmp && path_is_private_write_candidate(orig);
         if (!should_redirect) {
             if (g_mode == MODE_OBSERVE)
                 LOG("OBSERVE open: %s flags=0x%x", orig, flags);
@@ -698,7 +760,9 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             set_errno_result(drcontext, EPERM);
             return false;
         }
-        LOG("REMAP private-write open: %s -> %s flags=0x%x", orig, remapped, flags);
+        if (open_flags_write_intent(flags))
+            ensure_parent_dirs(remapped);
+        LOG("REMAP private open: %s -> %s flags=0x%x", orig, remapped, flags);
 
         if (strlen(remapped) <= strlen(orig)) {
             if (!dr_safe_write((void *)(uintptr_t)path_arg, strlen(remapped) + 1,
@@ -720,6 +784,49 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             }
         }
         return true;
+    }
+
+    /* --- private scratch VFS path operations ------------------ */
+    switch (sysnum) {
+        case SYS_stat:
+        case SYS_lstat:
+        case SYS_access:
+        case SYS_readlink:
+        case SYS_rmdir:
+        case SYS_unlink:
+        case SYS_truncate:
+        case SYS_statfs:
+            return remap_private_path_param(drcontext, sysnum, 0, "path", false);
+        case SYS_mkdir:
+            return remap_private_path_param(drcontext, sysnum, 0, "mkdir", true);
+        case SYS_fstatat:
+        case SYS_faccessat:
+        case SYS_faccessat2:
+        case SYS_readlinkat:
+        case SYS_unlinkat:
+        case SYS_utimensat:
+            return remap_private_path_param(drcontext, sysnum, 1, "at-path", false);
+        case SYS_mkdirat:
+            return remap_private_path_param(drcontext, sysnum, 1, "mkdirat", true);
+        case SYS_statx:
+            return remap_private_path_param(drcontext, sysnum, 1, "statx", false);
+        case SYS_rename:
+            if (!remap_private_path_param(drcontext, sysnum, 0, "rename-old", false)) return false;
+            return remap_private_path_param(drcontext, sysnum, 1, "rename-new", true);
+        case SYS_renameat:
+        case SYS_renameat2:
+            if (!remap_private_path_param(drcontext, sysnum, 1, "renameat-old", false)) return false;
+            return remap_private_path_param(drcontext, sysnum, 3, "renameat-new", true);
+        case SYS_link:
+            if (!remap_private_path_param(drcontext, sysnum, 0, "link-old", false)) return false;
+            return remap_private_path_param(drcontext, sysnum, 1, "link-new", true);
+        case SYS_linkat:
+            if (!remap_private_path_param(drcontext, sysnum, 1, "linkat-old", false)) return false;
+            return remap_private_path_param(drcontext, sysnum, 3, "linkat-new", true);
+        case SYS_symlink:
+            return remap_private_path_param(drcontext, sysnum, 1, "symlink-new", true);
+        case SYS_symlinkat:
+            return remap_private_path_param(drcontext, sysnum, 2, "symlinkat-new", true);
     }
 
     /* Observe mode is the compatibility-first mode for Wolfram/LF-style
