@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      deep_smoke:
+        description: Run the heavier DynamoRIO runtime policy smoke suite
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-wrapper:
+    name: Go wrapper tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test, vet, and build wrapper
+        run: |
+          set -euo pipefail
+          git diff --check
+          go test ./...
+          go vet ./...
+          go build ./cmd/dynamorio-sandbox
+
+      - name: Verify dry-run timeout command
+        run: |
+          set -euo pipefail
+          ./dynamorio-sandbox --dry-run \
+            --session 'job/Case #42__with spaces' \
+            --timeout 2s \
+            --timeout-kill-after 750ms \
+            -- /bin/echo ok \
+            | tee /tmp/dry-run.txt
+          grep -q -- '--init' /tmp/dry-run.txt
+          grep -q -- '--name dr-sandbox-job-Case-42-with-spaces' /tmp/dry-run.txt
+          grep -q -- 'timeout --kill-after=0.75s 2s' /tmp/dry-run.txt
+
+  transparent-docker-smoke:
+    name: Native x86_64 transparent Docker smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image and run transparent launcher smokes
+        run: |
+          set -euo pipefail
+          make smoke-transparent-stdio smoke-transparent-exit-code smoke-transparent-cwd-env
+
+  deep-runtime-smoke:
+    name: Deep DynamoRIO runtime smoke
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    if: github.event_name == 'workflow_dispatch' && inputs.deep_smoke
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image and run DR policy smokes
+        run: |
+          set -euo pipefail
+          make smoke-policy-config smoke-runtime-config
