@@ -43,26 +43,32 @@ Local Docker Desktop on Apple Silicon is useful for building the image but **not
 Verified on AWS CodeBuild native x86_64 Linux:
 
 ```text
-BUILD_ID=shimmy-dynamorio-docker-smoke:baac6a86-7237-4ceb-bf57-e178b7fa94b4
+BUILD_ID=shimmy-dynamorio-docker-smoke:8ebbb0aa-1812-400c-894c-27a53b2e84a6
 status=passed
 checks:
   - make docker-build
   - make smoke-private-tmp
   - make smoke-audit-jsonl
+  - make smoke-dynamic-shell
   - make demo
 ```
 
 Important observed smoke output:
 
 ```text
-[dr-sandbox][tmp-smoke] mode=observe redirect_tmp=true
-[dr-sandbox][tmp-smoke] REMAP private-write open: /tmp/shimmy-dr-tmp-side-effect.txt -> /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-tmp-side-effect.txt flags=0x241
+[dr-sandbox][tmp-smoke] mode=observe redirect_tmp=true audit_jsonl=false
+[dr-sandbox][tmp-smoke] REMAP mkdir syscall=83 param=0: /tmp/shimmy-dr-vfs -> /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs
+[dr-sandbox][tmp-smoke] REMAP private open: /tmp/shimmy-dr-vfs/side-effect.txt -> /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs/side-effect.txt flags=0x241
+[dr-sandbox][tmp-smoke] REMAP rename-old syscall=82 param=0: /tmp/shimmy-dr-vfs/side-effect.txt -> /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs/side-effect.txt
+[dr-sandbox][tmp-smoke] REMAP path syscall=87 param=0: /tmp/shimmy-dr-vfs/renamed.txt -> /tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs/renamed.txt
 ```
 
 The smoke asserted:
 
-- original `/tmp/shimmy-dr-tmp-side-effect.txt` did not exist after the run;
-- redirected `/tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-tmp-side-effect.txt` did exist.
+- original `/tmp/shimmy-dr-vfs` did not exist after the run;
+- redirected `/tmp/dr-sandbox/tmp-smoke/tmp/shimmy-dr-vfs` was also removed after the private VFS lifecycle;
+- `DR_AUDIT_JSONL=1` produced parseable/remappable JSONL evidence (`audit jsonl ok 12`);
+- a real dynamic `/bin/bash` process ran under observe mode and produced a much larger audit trace (`dynamic shell ok 322`).
 
 Strict-mode legacy smoke also passed:
 
@@ -73,11 +79,10 @@ test_open: open() returned EPERM (errno=1) - correctly blocked!
 
 ## Next executable slices
 
-1. Add observe-mode path handling for `statx`, `newfstatat`, `access/faccessat`, `mkdirat`, `unlinkat`, `renameat`, and `readlinkat` so virtual paths have a coherent view, not only write-open remapping.
-2. Add an audit log format that can be consumed as JSONL or summarized into a candidate policy profile.
-3. Add a Docker smoke that runs a non-trivial dynamic executable under observe mode (`python3 -c`, package import, cache write) before trying Wolfram.
-4. Add a Wolfram/LambdaFeedback Docker probe that compares no-DR vs DR observe mode for the same handler input/output.
-5. Only after correctness: collect rough cold container vs warm process timing.
+1. Add a Wolfram/LambdaFeedback Docker probe that compares no-DR vs DR observe mode for the same handler input/output.
+2. Feed the JSONL audit output from real Wolfram traces into a candidate profile summarizer.
+3. Expand private path coverage beyond temp/cache if Wolfram traces reveal other mutable state roots.
+4. Only after correctness: collect rough cold container vs warm process timing.
 
 ## Non-goals unless explicitly requested
 

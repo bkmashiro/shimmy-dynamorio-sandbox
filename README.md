@@ -108,6 +108,9 @@ make smoke-private-tmp
 # Verify JSONL audit output on native x86_64/CodeBuild
 make smoke-audit-jsonl
 
+# Verify a real dynamic /bin/bash process can run through observe mode
+make smoke-dynamic-shell
+
 # Run an arbitrary program in observe mode
 make docker-run EXEC=/bin/ls EXEC_ARGS="/tmp"
 

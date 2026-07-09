@@ -24,7 +24,7 @@ MAX_PROCS      ?= 5
 DR_MODE        ?= observe
 DR_REDIRECT_TMP ?= 1
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell clean
 
 all: client test-prog
 
@@ -108,6 +108,17 @@ smoke-audit-jsonl: docker-build
 	    --security-opt seccomp=unconfined \
 	    $(IMAGE_NAME) \
 	    bash -lc 'rm -rf /tmp/shimmy-dr-vfs /tmp/dr-sandbox/audit-smoke/tmp/shimmy-dr-vfs; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_tmp_write 2>/tmp/audit.log; grep -q "^{\"type\":\"path\"" /tmp/audit.log; grep -q "\"action\":\"remap\"" /tmp/audit.log; grep -q "\"path\":\"/tmp/shimmy-dr-vfs\"" /tmp/audit.log; grep -q "\"path\":\"/tmp/shimmy-dr-vfs/side-effect.txt\"" /tmp/audit.log; grep -q "\"remapped\":\"/tmp/dr-sandbox/audit-smoke/" /tmp/audit.log; echo audit jsonl ok $$(grep -c "^{" /tmp/audit.log)'
+
+# Dynamic-loader smoke: run a real dynamic /bin/bash process under observe mode.
+smoke-dynamic-shell: docker-build
+	docker run --rm \
+	    -e DR_SESSION_ID=dynamic-shell \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_REDIRECT_TMP=1 \
+	    -e DR_AUDIT_JSONL=1 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    bash -lc 'rm -rf /tmp/shimmy-dr-dynamic /tmp/dr-sandbox/dynamic-shell/tmp/shimmy-dr-dynamic; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /bin/bash -lc "mkdir -p /tmp/shimmy-dr-dynamic/cache && printf dynamic >/tmp/shimmy-dr-dynamic/cache/value.txt && test -f /tmp/shimmy-dr-dynamic/cache/value.txt && grep -q dynamic /tmp/shimmy-dr-dynamic/cache/value.txt && mv /tmp/shimmy-dr-dynamic/cache/value.txt /tmp/shimmy-dr-dynamic/cache/value2.txt && rm /tmp/shimmy-dr-dynamic/cache/value2.txt && rmdir /tmp/shimmy-dr-dynamic/cache && rmdir /tmp/shimmy-dr-dynamic" 2>/tmp/dynamic-audit.log; test ! -e /tmp/shimmy-dr-dynamic; grep -q "\"path\":\"/tmp/shimmy-dr-dynamic/cache/value.txt\"" /tmp/dynamic-audit.log; echo dynamic shell ok $$(grep -c "^{" /tmp/dynamic-audit.log)'
 
 ## ── Go wrapper ──────────────────────────────────────────────────
 
