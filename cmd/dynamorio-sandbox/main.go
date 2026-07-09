@@ -36,14 +36,23 @@ func randomHex(n int) string {
 }
 
 func main() {
-	execFlag    := flag.String("exec",      "",      "Program to execute inside the sandbox (required)")
-	argsFlag    := flag.String("args",      "",      "Space-separated arguments for the program")
+	execFlag := flag.String("exec", "", "Program to execute inside the sandbox (required)")
+	argsFlag := flag.String("args", "", "Space-separated arguments for the program")
 	timeoutFlag := flag.Duration("timeout", 30*time.Second, "Maximum execution time (e.g. 30s, 2m)")
-	memFlag     := flag.String("max-mem",  "256m",  "Container memory limit (e.g. 128m, 1g)")
-	procsFlag   := flag.Int("max-procs",   5,       "Maximum number of processes (--pids-limit)")
-	imageFlag   := flag.String("image",    defaultImage, "Docker image to use")
-	dryRunFlag  := flag.Bool("dry-run",   false,   "Print docker command without executing")
-	sessionFlag := flag.String("session",  "",      "Session ID (auto-generated if empty)")
+	memFlag := flag.String("max-mem", "256m", "Container memory limit (e.g. 128m, 1g)")
+	procsFlag := flag.Int("max-procs", 5, "Maximum number of processes (--pids-limit)")
+	imageFlag := flag.String("image", defaultImage, "Docker image to use")
+	dryRunFlag := flag.Bool("dry-run", false, "Print docker command without executing")
+	sessionFlag := flag.String("session", "", "Session ID (auto-generated if empty)")
+	modeFlag := flag.String("mode", "observe", "DR sandbox mode: observe or strict")
+	redirectTmpFlag := flag.Bool("redirect-tmp", true, "Redirect private temp/cache writes into the session VFS")
+	pathPolicyFlag := flag.String("path-policy", "", "DR_PATH_POLICY rules, e.g. ro:/data;private:/tmp/work;block:/secrets")
+	networkFlag := flag.String("network-policy", "", "Network policy override: allow or block")
+	execPolicyFlag := flag.String("exec-policy", "", "execve policy override: allow or block")
+	protExecFlag := flag.String("prot-exec-policy", "", "Executable-memory policy override: allow or block")
+	fileWriteFlag := flag.String("file-write-policy", "", "File-write policy override: allow or block/stdio")
+	maxReadBytesFlag := flag.String("max-read-bytes", "", "Per-read cap passed to DR_MAX_READ_BYTES, e.g. 1m or 4096")
+	drMaxProcsFlag := flag.Int("dr-max-procs", 0, "In-client process limit passed to DR_MAX_PROCS; defaults to the Docker pids limit")
 	flag.Parse()
 
 	if *execFlag == "" {
@@ -73,6 +82,24 @@ func main() {
 		"--security-opt", "seccomp=unconfined",
 		"--cap-drop", "ALL",
 		"-e", fmt.Sprintf("DR_SESSION_ID=%s", sessionID),
+		"-e", fmt.Sprintf("DR_SANDBOX_MODE=%s", *modeFlag),
+		"-e", fmt.Sprintf("DR_REDIRECT_TMP=%t", *redirectTmpFlag),
+	}
+	optionalEnv := [][2]string{
+		{"DR_PATH_POLICY", *pathPolicyFlag},
+		{"DR_NETWORK", *networkFlag},
+		{"DR_EXEC", *execPolicyFlag},
+		{"DR_PROT_EXEC", *protExecFlag},
+		{"DR_FILE_WRITE", *fileWriteFlag},
+		{"DR_MAX_READ_BYTES", *maxReadBytesFlag},
+	}
+	if *drMaxProcsFlag > 0 {
+		optionalEnv = append(optionalEnv, [2]string{"DR_MAX_PROCS", fmt.Sprintf("%d", *drMaxProcsFlag)})
+	}
+	for _, item := range optionalEnv {
+		if item[1] != "" {
+			dockerArgs = append(dockerArgs, "-e", fmt.Sprintf("%s=%s", item[0], item[1]))
+		}
 	}
 
 	// Inner command: timeout + drrun + filter + -- program args

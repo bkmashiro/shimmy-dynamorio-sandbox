@@ -362,6 +362,12 @@ static sandbox_mode_t g_mode = MODE_OBSERVE;
 static bool           g_redirect_tmp = true;
 static bool           g_audit_jsonl = false;
 static bool           g_human_log = true;
+static size_t         g_max_read_bytes = MAX_READ_BYTES;
+static int            g_max_procs = MAX_PROCS;
+static bool           g_block_network = false;
+static bool           g_block_exec = false;
+static bool           g_block_prot_exec = false;
+static bool           g_stdio_only_writes = false;
 static int            g_proc_count = 0;
 static void          *g_mutex;
 static path_policy_rule_t g_path_rules[32];
@@ -452,6 +458,55 @@ static void audit_syscall_event(const char *action, int sysnum)
     p += dr_snprintf(p, (size_t)(end - p), ",\"syscall\":%d}\n", sysnum);
     *p = '\0';
     audit_write_line(line);
+}
+
+static bool env_is_false(const char *value)
+{
+    return value && (strcmp(value, "0") == 0 || strcmp(value, "false") == 0 ||
+                     strcmp(value, "no") == 0 || strcmp(value, "allow") == 0 ||
+                     strcmp(value, "off") == 0);
+}
+
+static bool env_is_true(const char *value)
+{
+    return value && *value && !env_is_false(value);
+}
+
+static bool env_policy_blocks(const char *value, bool default_block)
+{
+    if (!value || !*value)
+        return default_block;
+    if (env_is_false(value))
+        return false;
+    if (strcmp(value, "block") == 0 || strcmp(value, "deny") == 0 ||
+        strcmp(value, "strict") == 0)
+        return true;
+    return env_is_true(value);
+}
+
+static size_t parse_size_env(const char *value, size_t fallback)
+{
+    if (!value || !*value)
+        return fallback;
+    char *endp = NULL;
+    unsigned long long n = strtoull(value, &endp, 10);
+    if (endp == value)
+        return fallback;
+    if (*endp == 'k' || *endp == 'K') n *= 1024ULL;
+    else if (*endp == 'm' || *endp == 'M') n *= 1024ULL * 1024ULL;
+    else if (*endp == 'g' || *endp == 'G') n *= 1024ULL * 1024ULL * 1024ULL;
+    return n > 0 ? (size_t)n : fallback;
+}
+
+static int parse_int_env(const char *value, int fallback)
+{
+    if (!value || !*value)
+        return fallback;
+    char *endp = NULL;
+    long n = strtol(value, &endp, 10);
+    if (endp == value || n < 1 || n > 100000)
+        return fallback;
+    return (int)n;
 }
 
 /* ── path canonicalization: resolve ".." components in-place ─── */
@@ -1090,6 +1145,120 @@ static bool event_pre_syscall(void *drcontext, int sysnum)
             return remap_private_path_param(drcontext, sysnum, 2, "symlinkat-new", true);
     }
 
+    /* --- configurable non-path controls ----------------------- */
+    if (sysnum == SYS_write || sysnum == SYS_writev || sysnum == SYS_pwrite64) {
+        reg_t fd = dr_syscall_get_param(drcontext, 0);
+        if (g_stdio_only_writes && fd != 1 && fd != 2) {
+            LOG("BLOCK write: fd=%ld", (long)fd);
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, EPERM);
+            return false;
+        }
+        return true;
+    }
+
+    if (sysnum == SYS_read || sysnum == SYS_pread64) {
+        reg_t count = dr_syscall_get_param(drcontext, 2);
+        if ((size_t)count > g_max_read_bytes) {
+            LOG("CAP read: %ld -> %llu", (long)count, (unsigned long long)g_max_read_bytes);
+            audit_syscall_event("cap", sysnum);
+            dr_syscall_set_param(drcontext, 2, (reg_t)g_max_read_bytes);
+        }
+        return true;
+    }
+
+    if (sysnum == SYS_mmap) {
+        reg_t prot = dr_syscall_get_param(drcontext, 2);
+        if (g_block_prot_exec && (prot & PROT_EXEC)) {
+            LOG("WARN mmap PROT_EXEC requested (prot=0x%lx) - BLOCKED", (long)prot);
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, EPERM);
+            return false;
+        }
+        return true;
+    }
+
+    if (sysnum == SYS_mprotect) {
+        reg_t prot = dr_syscall_get_param(drcontext, 2);
+        if (g_block_prot_exec && (prot & PROT_EXEC)) {
+            LOG("WARN mprotect PROT_EXEC requested (prot=0x%lx) - BLOCKED", (long)prot);
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, EPERM);
+            return false;
+        }
+        return true;
+    }
+
+    switch (sysnum) {
+        case SYS_socket:
+        case SYS_connect:
+        case SYS_bind:
+        case SYS_listen:
+        case SYS_accept:
+        case SYS_accept4:
+        case SYS_sendto:
+        case SYS_recvfrom:
+        case SYS_sendmsg:
+        case SYS_recvmsg:
+        case SYS_sendmmsg:
+        case SYS_recvmmsg:
+        case SYS_shutdown:
+        case SYS_getsockname:
+        case SYS_getpeername:
+        case SYS_socketpair:
+        case SYS_setsockopt:
+        case SYS_getsockopt:
+            if (g_block_network) {
+                LOG("BLOCK network syscall %d", sysnum);
+                audit_syscall_event("block", sysnum);
+                set_errno_result(drcontext, ENETDOWN);
+                return false;
+            }
+            return true;
+    }
+
+    if (sysnum == SYS_execve || sysnum == SYS_execveat) {
+        if (g_block_exec) {
+            LOG("BLOCK execve");
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, EPERM);
+            return false;
+        }
+        return true;
+    }
+
+    if (sysnum == SYS_fork || sysnum == SYS_vfork) {
+        dr_mutex_lock(g_mutex);
+        int cnt = ++g_proc_count;
+        dr_mutex_unlock(g_mutex);
+        if (cnt > g_max_procs) {
+            LOG("BLOCK fork: proc limit %d exceeded", g_max_procs);
+            audit_syscall_event("block", sysnum);
+            set_errno_result(drcontext, EAGAIN);
+            return false;
+        }
+        LOG("ALLOW fork (%d/%d)", cnt, g_max_procs);
+        return true;
+    }
+
+    if (sysnum == SYS_clone || sysnum == SYS_clone3) {
+        reg_t flags = dr_syscall_get_param(drcontext, 0);
+        bool new_proc = !(flags & 0x00010000 /*CLONE_THREAD*/);
+        if (new_proc) {
+            dr_mutex_lock(g_mutex);
+            int cnt = ++g_proc_count;
+            dr_mutex_unlock(g_mutex);
+            if (cnt > g_max_procs) {
+                LOG("BLOCK clone(new-proc): proc limit %d exceeded", g_max_procs);
+                audit_syscall_event("block", sysnum);
+                set_errno_result(drcontext, EAGAIN);
+                return false;
+            }
+            LOG("ALLOW clone(new-proc) (%d/%d)", cnt, g_max_procs);
+        }
+        return true;
+    }
+
     /* Observe mode is the compatibility-first mode for Wolfram/LF-style
      * Docker probes: after selected path virtualization above, pass every other
      * syscall through while logging enough to build an enforce profile later.
@@ -1245,10 +1414,19 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
         g_mode = MODE_OBSERVE;
 
     const char *env_redirect_tmp = getenv("DR_REDIRECT_TMP");
-    if (env_redirect_tmp &&
-        (strcmp(env_redirect_tmp, "0") == 0 || strcmp(env_redirect_tmp, "false") == 0 ||
-         strcmp(env_redirect_tmp, "no") == 0))
+    if (env_redirect_tmp && env_is_false(env_redirect_tmp))
         g_redirect_tmp = false;
+
+    g_block_network = g_mode == MODE_STRICT;
+    g_block_exec = g_mode == MODE_STRICT;
+    g_block_prot_exec = g_mode == MODE_STRICT;
+    g_stdio_only_writes = g_mode == MODE_STRICT;
+    g_max_read_bytes = parse_size_env(getenv("DR_MAX_READ_BYTES"), MAX_READ_BYTES);
+    g_max_procs = parse_int_env(getenv("DR_MAX_PROCS"), MAX_PROCS);
+    g_block_network = env_policy_blocks(getenv("DR_NETWORK"), g_block_network);
+    g_block_exec = env_policy_blocks(getenv("DR_EXEC"), g_block_exec);
+    g_block_prot_exec = env_policy_blocks(getenv("DR_PROT_EXEC"), g_block_prot_exec);
+    g_stdio_only_writes = env_policy_blocks(getenv("DR_FILE_WRITE"), g_stdio_only_writes);
 
     const char *env_audit_jsonl = getenv("DR_AUDIT_JSONL");
     if (env_audit_jsonl && *env_audit_jsonl &&
@@ -1284,8 +1462,11 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char *argv[])
     dr_register_filter_syscall_event(event_filter_syscall);
     dr_register_pre_syscall_event(event_pre_syscall);
 
-    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s audit_jsonl=%s path_rules=%d",
+    LOG("syscall virtualization active - sandbox: %s mode=%s redirect_tmp=%s audit_jsonl=%s path_rules=%d net=%s exec=%s prot_exec=%s file_write=%s max_read=%llu max_procs=%d",
         g_sandbox_root, g_mode == MODE_STRICT ? "strict" : "observe",
         g_redirect_tmp ? "true" : "false", g_audit_jsonl ? "true" : "false",
-        g_path_rule_count);
+        g_path_rule_count,
+        g_block_network ? "block" : "allow", g_block_exec ? "block" : "allow",
+        g_block_prot_exec ? "block" : "allow", g_stdio_only_writes ? "stdio" : "allow",
+        (unsigned long long)g_max_read_bytes, g_max_procs);
 }

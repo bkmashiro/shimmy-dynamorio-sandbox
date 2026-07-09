@@ -2,7 +2,7 @@
 #
 # Targets:
 #   client      – build syscall_filter.so (inside Docker)
-#   test-prog   – build test_open/test_tmp_write static binaries (inside Docker)
+#   test-prog   – build test_open/test_tmp_write/test_runtime_controls static binaries (inside Docker)
 #   docker-build – build the Docker image
 #   docker-run   – run a command under DynamoRIO in Docker
 #   demo        – full end-to-end demo
@@ -23,8 +23,15 @@ MAX_MEM        ?= 256m
 MAX_PROCS      ?= 5
 DR_MODE        ?= observe
 DR_REDIRECT_TMP ?= 1
+DR_PATH_POLICY ?=
+DR_NETWORK     ?=
+DR_EXEC        ?=
+DR_PROT_EXEC   ?=
+DR_FILE_WRITE  ?=
+DR_MAX_READ_BYTES ?=
+DR_MAX_PROCS   ?=
 
-.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config clean
+.PHONY: all client test-prog docker-build docker-run demo smoke-private-tmp smoke-audit-jsonl smoke-dynamic-shell smoke-wolfram-path-policy smoke-policy-config smoke-runtime-config clean
 
 all: client test-prog
 
@@ -40,12 +47,15 @@ syscall_filter.so: syscall_filter.c
 	    -L$(DYNAMORIO_HOME)/lib64/release \
 	    -ldynamorio
 
-test-prog: test_open test_tmp_write
+test-prog: test_open test_tmp_write test_runtime_controls
 
 test_open: test_open.c
 	$(CC) -static -O2 -o $@ $<
 
 test_tmp_write: test_tmp_write.c
+	$(CC) -static -O2 -o $@ $<
+
+test_runtime_controls: test_runtime_controls.c
 	$(CC) -static -O2 -o $@ $<
 
 ## ── Docker targets ──────────────────────────────────────────────
@@ -60,6 +70,13 @@ docker-run:
 	    -e DR_SESSION_ID=$(SESSION_ID) \
 	    -e DR_SANDBOX_MODE=$(DR_MODE) \
 	    -e DR_REDIRECT_TMP=$(DR_REDIRECT_TMP) \
+	    -e DR_PATH_POLICY='$(DR_PATH_POLICY)' \
+	    -e DR_NETWORK='$(DR_NETWORK)' \
+	    -e DR_EXEC='$(DR_EXEC)' \
+	    -e DR_PROT_EXEC='$(DR_PROT_EXEC)' \
+	    -e DR_FILE_WRITE='$(DR_FILE_WRITE)' \
+	    -e DR_MAX_READ_BYTES='$(DR_MAX_READ_BYTES)' \
+	    -e DR_MAX_PROCS='$(DR_MAX_PROCS)' \
 	    --memory=$(MAX_MEM) \
 	    --pids-limit=$(MAX_PROCS) \
 	    --security-opt seccomp=unconfined \
@@ -149,6 +166,32 @@ smoke-policy-config: docker-build
 	    $(IMAGE_NAME) \
 	    bash -euo pipefail -lc 'rm -rf /tmp/dr-ro /tmp/dr-rw /tmp/dr-private /tmp/dr-block /tmp/dr-sandbox/policy-config /tmp/dr-policy-audit.jsonl; mkdir -p /tmp/dr-ro /tmp/dr-rw /tmp/dr-private /tmp/dr-block; printf readable >/tmp/dr-ro/input.txt; printf secret >/tmp/dr-block/input.txt; $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /bin/bash -lc "grep -q readable /tmp/dr-ro/input.txt && ! printf nope >/tmp/dr-ro/out.txt && printf shared >/tmp/dr-rw/out.txt && printf private >/tmp/dr-private/out.txt && ! cat /tmp/dr-block/input.txt >/dev/null"; grep -q shared /tmp/dr-rw/out.txt; test ! -e /tmp/dr-private/out.txt; grep -q private /tmp/dr-sandbox/policy-config/tmp/dr-private/out.txt; grep -q "\"action\":\"readonly\"" /tmp/dr-policy-audit.jsonl; grep -q "\"action\":\"block\"" /tmp/dr-policy-audit.jsonl; grep -q "\"action\":\"remap\"" /tmp/dr-policy-audit.jsonl; echo policy config ok $$(wc -l </tmp/dr-policy-audit.jsonl)'
 
+# Runtime-control smoke: configurable traditional-sandbox style knobs for read
+# caps, network syscalls, and executable memory work in observe mode too.
+smoke-runtime-config: docker-build
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-read \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_REDIRECT_TMP=0 \
+	    -e DR_MAX_READ_BYTES=4 \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls readcap
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-net \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_NETWORK=block \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls socket
+	docker run --rm \
+	    -e DR_SESSION_ID=runtime-config-protexec \
+	    -e DR_SANDBOX_MODE=observe \
+	    -e DR_PROT_EXEC=block \
+	    --security-opt seccomp=unconfined \
+	    $(IMAGE_NAME) \
+	    $(DYNAMORIO_HOME)/bin64/drrun -c /opt/sandbox/syscall_filter.so -- /opt/sandbox/test_runtime_controls prot_exec
+
 ## ── Go wrapper ──────────────────────────────────────────────────
 
 go-build:
@@ -157,5 +200,5 @@ go-build:
 ## ── cleanup ─────────────────────────────────────────────────────
 
 clean:
-	rm -f syscall_filter.so test_open bin/dynamorio-sandbox
+	rm -f syscall_filter.so test_open test_tmp_write test_runtime_controls bin/dynamorio-sandbox
 	docker rmi -f $(IMAGE_NAME) 2>/dev/null || true

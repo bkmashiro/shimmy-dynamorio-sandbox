@@ -17,6 +17,12 @@ This prototype now supports two runtime modes:
 | `DR_AUDIT_PATH=/tmp/dr-audit.jsonl` | Write JSONL audit to a separate append-only file instead of stderr, avoiding corrupted/interleaved audit when Wolfram child processes also write stderr. |
 | `DR_HUMAN_LOG=0` | Disable human-readable `[dr-sandbox]` logs; useful when collecting clean audit files. |
 | `DR_PATH_POLICY='ro:/data/ref;rw:/tmp/shared;private:/tmp/work;block:/secrets'` | Optional first-match path policy. Actions: `ro`/`readonly` allows reads but blocks write-intent opens and mutating path ops; `rw`/`pass` leaves the path shared; `private` remaps into `/tmp/dr-sandbox/<session-id>/...`; `block` denies access. Rules are separated by `;` or `,`. |
+| `DR_NETWORK=allow|block` | Override network syscall policy. Strict mode defaults to `block`; observe mode defaults to `allow`. |
+| `DR_EXEC=allow|block` | Override `execve`/`execveat` policy. Strict mode defaults to `block`; observe mode defaults to `allow`. |
+| `DR_PROT_EXEC=allow|block` | Override executable memory (`mmap`/`mprotect` with `PROT_EXEC`). Strict defaults to `block`; observe defaults to `allow`. |
+| `DR_FILE_WRITE=allow|block` | Override fd-write policy. `block` means only stdout/stderr writes are allowed; strict defaults to this. |
+| `DR_MAX_READ_BYTES=1m` | Cap bytes per `read`/`pread64` syscall; default is `1 MiB`. |
+| `DR_MAX_PROCS=5` | In-client fork/clone process limit; pair with Docker `--pids-limit` for kernel-level enforcement. |
 
 Use observe mode first, then derive a narrower enforce profile from logs. Do not start by blocking everything: Wolfram may legitimately write license/cache/paclet/temp files.
 
@@ -117,6 +123,9 @@ make smoke-wolfram-path-policy
 # Verify configurable path policies: read-only, read-write/shared, private/remapped, blocked
 make smoke-policy-config
 
+# Verify configurable runtime controls: read cap, network block, executable-memory block
+make smoke-runtime-config
+
 # Verify a real dynamic /bin/bash process can run through observe mode
 make smoke-dynamic-shell
 
@@ -139,7 +148,15 @@ dynamorio-sandbox [flags]
   --args      string    Space-separated arguments
   --timeout   duration  Max execution time (default 30s)
   --max-mem   string    Memory limit (default 256m)
-  --max-procs int       Max pids-limit (default 5)
+  --max-procs int       Docker pids-limit (default 5)
+  --mode      string    DR mode: observe or strict (default observe)
+  --path-policy string  DR_PATH_POLICY rules, e.g. ro:/data;private:/tmp/work;block:/secrets
+  --network-policy string    Network policy override: allow or block
+  --exec-policy string       execve policy override: allow or block
+  --prot-exec-policy string  Executable-memory policy override: allow or block
+  --file-write-policy string fd write policy override: allow or block/stdio
+  --max-read-bytes string    Per-read cap, e.g. 1m or 4096
+  --dr-max-procs int         In-client fork/clone limit
   --image     string    Docker image (default dynamorio-sandbox)
   --session   string    Session ID (auto-generated)
   --dry-run             Print docker command, don't run
